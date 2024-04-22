@@ -1,9 +1,8 @@
 name: ci
 
 on:
-  push:
-    branches:
-      - "main"
+  schedule:
+    - cron:  '0 0 * * *' # Runs at 12:00 AM every day
 
 jobs:
   docker:
@@ -21,7 +20,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          file: ./Dockerfile
+          file: ./docker-compose/bettergpt/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: pawanosman/chatgpt:latest
+          tags: pawanosman/bettergpt:latest

@@ -4,14 +4,17 @@ FROM node:19-alpine
 # Set the working directory
 WORKDIR /app
 
-# Copy source code
-COPY . .
+# Install git
+RUN apk add --no-cache git
+
+# Clone the project repository
+RUN git clone https://github.com/ztjhz/BetterChatGPT.git /app
 
 # Install dependencies
 RUN npm install
 
 # Expose the port the app runs on
-EXPOSE 3040
+EXPOSE 5173
 
 # Command to run the start script
-CMD ["sh", "start.sh"]
+CMD ["npm", "run", "dev"]
