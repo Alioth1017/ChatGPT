@@ -20,9 +20,10 @@ import * as fs from "fs/promises";
 import { createWriteStream } from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as net from "net";
 import { spawn, execFile } from "child_process";
 import * as vscode from "vscode";
-import { ensureRuntimeDeps } from "../runtimeDeps";
+import { importRuntimeDep } from "../runtimeDeps";
 
 /**
  * llama-server launch configuration. Used both as the global default and as a
@@ -132,7 +133,18 @@ const LEGACY_BIN = "llama-server";
 /** Resolved at install-check time: argv prefix to launch the server. */
 let serverCmd: { bin: string; pre: string[] } = { bin: UNIFIED_BIN, pre: ["serve"] };
 const MAX_LOG_LINES = 500;
-let BASE_PORT = 8080;
+
+/** Ask the OS for a free ephemeral port (bind :0, read the assigned port). */
+function getFreePort(host = "127.0.0.1"): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, host, () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 let modelsDir: string | undefined;
 let extCtx: vscode.ExtensionContext | undefined;
@@ -225,8 +237,7 @@ export async function installLlamacpp(): Promise<void> {
 
 // ---- HF GGUF search ----
 export async function searchGguf(query: string, limit = 20): Promise<HfGgufResult[]> {
-  if (!(await ensureRuntimeDeps())) throw new Error("runtime deps unavailable");
-  const hub = await import("@huggingface/hub");
+  const hub = await importRuntimeDep("@huggingface/hub");
   const out: HfGgufResult[] = [];
   for await (const m of hub.listModels({
     search: { query, tags: ["gguf"] },
@@ -240,8 +251,7 @@ export async function searchGguf(query: string, limit = 20): Promise<HfGgufResul
 
 /** List the .gguf files inside a repo so the user can pick a quantization. */
 export async function listRepoGgufFiles(repo: string): Promise<HfGgufResult[]> {
-  if (!(await ensureRuntimeDeps())) throw new Error("runtime deps unavailable");
-  const hub = await import("@huggingface/hub");
+  const hub = await importRuntimeDep("@huggingface/hub");
   const files: HfGgufResult[] = [];
   for await (const f of hub.listFiles({ repo, recursive: true })) {
     if (f.type === "file" && /\.gguf$/i.test(f.path)) {
@@ -297,7 +307,6 @@ export async function importGguf(srcPath: string): Promise<LlamacppModel> {
   return makeModel({ file: base, filePath: dest, sizeBytes: stat.size, name: path.basename(base, ".gguf") });
 }
 
-let portCursor = 0;
 function makeModel(p: { repo?: string; file: string; filePath: string; sizeBytes?: number; name: string }): LlamacppModel {
   return {
     id: modelId(p.repo, p.file),
@@ -306,7 +315,7 @@ function makeModel(p: { repo?: string; file: string; filePath: string; sizeBytes
     repo: p.repo,
     file: p.file,
     sizeBytes: p.sizeBytes,
-    port: BASE_PORT + (portCursor++ % 100),
+    port: 0, // assigned per-load: a fresh random free port every time
     autoLoad: false,
   };
 }
@@ -347,9 +356,11 @@ export function effectiveContextLength(m: LlamacppModel, globalCtx: number): num
   return cfg.ctxSize ?? globalCtx;
 }
 
-/** Effective bind port: per-model config override (when set) else the model's assigned port. */
+/** Effective bind port: the running server's port, else a per-model config override. */
 function effectivePort(m: LlamacppModel, cfg: LlamacppServerConfig): number {
-  return m.useCustomConfig && cfg.port ? cfg.port : m.port;
+  const r = running.get(m.id);
+  if (r) return r.port;
+  return (m.useCustomConfig && cfg.port) || 0;
 }
 
 /** Base URL of a model's local OpenAI-compatible server (no trailing slash). */
@@ -360,8 +371,8 @@ export function serverUrlFor(m: LlamacppModel, globalCfg?: LlamacppServerConfig)
 }
 
 /** Build the llama-server argv from a model + effective config. */
-function buildArgs(m: LlamacppModel, cfg: LlamacppServerConfig): string[] {
-  const args: string[] = ["-m", m.filePath, "--port", String(effectivePort(m, cfg)), "--host", cfg.host || "127.0.0.1"];
+function buildArgs(m: LlamacppModel, cfg: LlamacppServerConfig, port: number): string[] {
+  const args: string[] = ["-m", m.filePath, "--port", String(port), "--host", cfg.host || "127.0.0.1"];
   if (cfg.ctxSize != null) args.push("--ctx-size", String(cfg.ctxSize));
   args.push(cfg.jinja === false ? "--no-jinja" : "--jinja");
   if (cfg.flashAttn) args.push("-fa", cfg.flashAttn);
@@ -390,19 +401,53 @@ export async function loadModel(m: LlamacppModel, globalCfg?: LlamacppServerConf
   errors.delete(m.id);
   logs.set(m.id, []); // fresh log per load
   loading.set(m.id, true);
+  emit(); // surface loading state immediately
   // Back-compat: callers used to pass a global context length number.
   const gcfg: LlamacppServerConfig | undefined =
     typeof globalCfg === "number" ? { ctxSize: globalCfg } : globalCfg;
   const cfg = effectiveConfig(m, gcfg);
-  const port = effectivePort(m, cfg);
   const host = cfg.host && cfg.host !== "0.0.0.0" ? cfg.host : "127.0.0.1";
-  const argv = [...serverCmd.pre, ...buildArgs(m, cfg)];
+
+  // Always launch on a fresh OS-assigned random port. If the server still
+  // fails to bind (TOCTOU race with another process), retry with a new one.
+  const MAX_BIND_TRIES = 3;
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= MAX_BIND_TRIES; attempt++) {
+    let port: number;
+    try {
+      port = await getFreePort(cfg.host || "127.0.0.1");
+    } catch (e: any) {
+      lastErr = new Error(`could not find a free port: ${e?.message || e}`);
+      break;
+    }
+    try {
+      await spawnServer(m, cfg, host, port);
+      return; // loaded
+    } catch (e: any) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      // Bind failure → retry on a new random port; anything else is fatal.
+      const bindFail = /couldn't bind|address already in use|EADDRINUSE|HTTP server error/i.test(lastErr.message) ||
+        (logs.get(m.id) || []).some((l) => /couldn't bind|address already in use/i.test(l));
+      if (!bindFail) break;
+      appendLog(m.id, `[retry] port ${port} unavailable, trying a new random port (${attempt}/${MAX_BIND_TRIES})`);
+    }
+  }
+  loading.delete(m.id);
+  const msg = lastErr?.message || "failed to start server";
+  errors.set(m.id, msg);
+  emit();
+  throw new Error(msg);
+}
+
+/** Spawn one llama-server on `port` and resolve when /health reports ready. */
+function spawnServer(m: LlamacppModel, cfg: LlamacppServerConfig, host: string, port: number): Promise<void> {
+  const argv = [...serverCmd.pre, ...buildArgs(m, cfg, port)];
   appendLog(m.id, `$ ${serverCmd.bin} ${argv.join(" ")}`);
   const proc = spawn(serverCmd.bin, argv, { stdio: ["ignore", "pipe", "pipe"] });
   running.set(m.id, { proc, port });
   proc.stdout?.on("data", (b) => appendLog(m.id, b.toString()));
   proc.stderr?.on("data", (b) => appendLog(m.id, b.toString()));
-  emit(); // surface loading state immediately
+  emit();
 
   let resolved = false;
   return new Promise<void>((resolve, reject) => {
@@ -410,8 +455,6 @@ export async function loadModel(m: LlamacppModel, globalCfg?: LlamacppServerConf
       if (resolved) return;
       resolved = true;
       running.delete(m.id);
-      loading.delete(m.id);
-      errors.set(m.id, msg);
       appendLog(m.id, `[error] ${msg}`);
       emit();
       reject(new Error(msg));
@@ -432,7 +475,7 @@ export async function loadModel(m: LlamacppModel, globalCfg?: LlamacppServerConf
         if (r.ok) {
           resolved = true;
           loading.delete(m.id);
-          appendLog(m.id, "[ready] model loaded");
+          appendLog(m.id, `[ready] model loaded on port ${port}`);
           emit();
           resolve();
           return;

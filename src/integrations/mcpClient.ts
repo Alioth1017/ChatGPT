@@ -295,33 +295,3 @@ export class McpManager {
 }
 
 export const mcpManager = new McpManager();
-
-/** A server entry from the official MCP registry (registry.modelcontextprotocol.io). */
-export interface RegistryServer {
-  name: string;
-  title?: string;
-  description?: string;
-  version?: string;
-  packages?: {
-    registryType?: string;
-    identifier?: string;
-    version?: string;
-    runtimeHint?: string;
-    transport?: { type?: string };
-    runtimeArguments?: { type?: string; name?: string; value?: string }[];
-    packageArguments?: { type?: string; name?: string; value?: string }[];
-    environmentVariables?: { name?: string; description?: string; isRequired?: boolean; isSecret?: boolean }[];
-  }[];
-}
-
-/**
- * Search the official MCP registry. Runs in the extension host (not the webview)
- * so it isn't blocked by the webview CSP. Empty query returns a default listing.
- */
-export async function searchMcpRegistry(query: string, limit = 30): Promise<RegistryServer[]> {
-  const url = `https://registry.modelcontextprotocol.io/v0.1/servers?limit=${limit}${query.trim() ? `&search=${encodeURIComponent(query.trim())}` : ""}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`registry ${r.status}`);
-  const data = (await r.json()) as { servers?: { server: RegistryServer }[] };
-  return (data.servers ?? []).map((s) => s.server);
-}

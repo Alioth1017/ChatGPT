@@ -311,10 +311,32 @@ function parseTitle(content: string): string {
 }
 
 /** Auto mode judge: pick the best-suited model id from candidates for a task. */
-export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean): Promise<string> {
+export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean, oauthKind?: OAuthKind): Promise<string> {
   const useAnthropic = anthropic ?? isAnthropic(apiBaseUrl);
   const sys = `You route a coding task to the best model. Available models: ${candidates.join(", ")}. Reply with EXACTLY one model id from the list, nothing else.`;
   const prompt = task.slice(0, 2000);
+  if (oauthKind) {
+    // OAuth judges (Claude Code / Codex) have no raw HTTP endpoint; stream a tiny completion.
+    let text = "";
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30_000);
+    try {
+      const gen = streamOAuthChat(oauthKind, {
+        model: judge,
+        messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+        maxTokens: 64,
+        signal: ctrl.signal,
+      });
+      for await (const ev of gen) {
+        if (ev.type === "text-delta") text += ev.text;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    // Reasoning models may emit <think> blocks; last non-empty line is the answer.
+    const lines = text.replace(/<think>[\s\S]*?<\/think>/gi, "").split("\n").map((l) => l.trim()).filter(Boolean);
+    return lines.length ? lines[lines.length - 1] : text.trim();
+  }
   if (useAnthropic) {
     const r = await fetch(`${apiBaseUrl}/messages`, {
       method: "POST",

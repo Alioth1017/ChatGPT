@@ -21,7 +21,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as crypto from "crypto";
 import { walk } from "./tools/shared";
-import { ensureRuntimeDeps } from "../runtimeDeps";
+import { importRuntimeDep } from "../runtimeDeps";
 
 // Selectable local embedding models. Add entries here to offer more choices.
 export interface EmbedModel {
@@ -111,8 +111,7 @@ async function getExtractor(): Promise<any | null> {
   if (!extractorP) {
     const m = activeModel;
     extractorP = (async () => {
-      if (!(await ensureRuntimeDeps())) throw new Error("runtime deps unavailable");
-      const t = await import("@huggingface/transformers");
+      const t = await importRuntimeDep("@huggingface/transformers");
       t.env.allowRemoteModels = true;
       t.env.cacheDir = path.join(storageDir!, "models");
       return t.pipeline("feature-extraction", m.repo, { dtype: m.dtype });

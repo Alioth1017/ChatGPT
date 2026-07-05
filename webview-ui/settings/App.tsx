@@ -77,7 +77,7 @@ const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   behavior: "workspace context file reading terminal tools auto edits approval allow deny ask review policy allowlist denylist commands mcp web",
   personas: "persona system prompt custom",
   rules: "rules skills subagents",
-  mcp: "mcp tools servers marketplace",
+  mcp: "mcp tools servers",
   hooks: "hooks events commands",
   indexing: "codebase index embedding docs semantic sync",
   advanced: "system prompt custom instructions",
@@ -730,6 +730,7 @@ export function App() {
                 <Row title="Auto-Generate Chat Titles" desc="Generate a short AI title for new conversations after the first message.">
                   <Toggle checked={features.autoGenerateTitles !== false} onChange={(v) => setFeatures({ autoGenerateTitles: v })} />
                 </Row>
+                {/* Auto model (judge routing) hidden for now — bring back later.
                 <Row title="Auto Judge Model" desc="When the chat model is set to Auto, this judge model picks the best enabled model for each task.">
                   <ModelSelect
                     models={modelList.length ? modelList : [...modelCatalog, ...(features.customModels || [])].filter((m) => features.enabledModels.includes(m.id))}
@@ -739,6 +740,7 @@ export function App() {
                     style={{ maxWidth: 240 }}
                   />
                 </Row>
+                */}
               </Group>
 
               <div className="section-label">Notifications</div>

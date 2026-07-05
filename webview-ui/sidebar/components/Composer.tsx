@@ -8,6 +8,7 @@
  */
 
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { ArrowUp, AtSign, ChevronRight, Square } from "lucide-react";
 import { Icon, IconName } from "../../shared/icons";
 import { vscode } from "../../shared/vscode";
@@ -261,12 +262,58 @@ function useOutsideClose(open: boolean, close: () => void) {
   }, [open, close]);
 }
 
+/**
+ * Anchor a position:fixed dropdown to its trigger, adapting to viewport space:
+ * opens above when there's room, flips below otherwise; clamps horizontally.
+ * Returns inline styles (left/top or left/bottom) + max height for the menu.
+ */
+function useAnchoredMenu(open: boolean, triggerRef: React.RefObject<HTMLElement | null>, menuRef: React.RefObject<HTMLElement | null>, deps: unknown[] = []) {
+  const [style, setStyle] = React.useState<React.CSSProperties>({});
+  const [maxH, setMaxH] = React.useState(340);
+  React.useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const t = triggerRef.current?.getBoundingClientRect();
+      const m = menuRef.current;
+      if (!t || !m) return;
+      const margin = 8;
+      const w = m.offsetWidth;
+      let left = t.left;
+      if (left + w > window.innerWidth - margin) left = window.innerWidth - margin - w;
+      if (left < margin) left = margin;
+      const spaceAbove = t.top - margin * 2;
+      const spaceBelow = window.innerHeight - t.bottom - margin * 2;
+      const needed = Math.min(340, m.scrollHeight || 340);
+      if (spaceAbove >= needed || spaceAbove >= spaceBelow) {
+        setStyle({ left, bottom: window.innerHeight - t.top + 6, top: "auto" });
+        setMaxH(Math.min(340, spaceAbove));
+      } else {
+        setStyle({ left, top: t.bottom + 6, bottom: "auto" });
+        setMaxH(Math.min(340, spaceBelow));
+      }
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, ...deps]);
+  return { style, maxH };
+}
+
 function ModePicker({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void }) {
   const [open, setOpen] = React.useState(false);
   useOutsideClose(open, () => setOpen(false));
+  const triggerRef = React.useRef<HTMLSpanElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const { style } = useAnchoredMenu(open, triggerRef, menuRef);
   const meta = MODES.find((m) => m.id === mode) || MODES[0];
   return (
     <span
+      ref={triggerRef}
       className="pill mode-pill"
       onClick={(e) => {
         e.stopPropagation();
@@ -276,8 +323,8 @@ function ModePicker({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void })
       <Icon name={meta.icon} />
       <span>{meta.label}</span>
       <Icon name="chevD" className="cd" />
-      {open && (
-        <div className="mode-dropdown">
+      {open && createPortal(
+        <div ref={menuRef} className="mode-dropdown" style={style}>
           {MODES.map((o) => (
             <div
               key={o.id}
@@ -299,7 +346,8 @@ function ModePicker({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void })
               )}
             </div>
           ))}
-        </div>
+        </div>,
+        document.body
       )}
     </span>
   );
@@ -519,28 +567,8 @@ function ModelPicker({
 
   const triggerRef = React.useRef<HTMLSpanElement>(null);
   const pickerRef = React.useRef<HTMLDivElement>(null);
-  const [pos, setPos] = React.useState<{ left: number; bottom: number; maxH: number }>({ left: 0, bottom: 0, maxH: 340 });
-
-  // Anchor the fixed picker above the trigger, clamped inside the viewport.
-  React.useLayoutEffect(() => {
-    if (!open) return;
-    const place = () => {
-      const t = triggerRef.current?.getBoundingClientRect();
-      const p = pickerRef.current;
-      if (!t || !p) return;
-      const w = p.offsetWidth;
-      const margin = 8;
-      let left = t.left;
-      if (left + w > window.innerWidth - margin) left = window.innerWidth - margin - w;
-      if (left < margin) left = margin;
-      const bottom = window.innerHeight - t.top + 8;
-      // Never extend past the top of the viewport; keep a margin above.
-      setPos({ left, bottom, maxH: Math.min(340, window.innerHeight - bottom - margin) });
-    };
-    place();
-    window.addEventListener("resize", place);
-    return () => window.removeEventListener("resize", place);
-  }, [open, list.length, !!editing]);
+  // Anchor the fixed picker to the trigger; flips below when no room above.
+  const { style: pickerStyle, maxH } = useAnchoredMenu(open, triggerRef, pickerRef, [list.length, !!editing]);
 
   const pick = (id: string) => {
     onSelect(id);
@@ -561,8 +589,8 @@ function ModelPicker({
       <span className="label">{selLabel}</span>
       {summary && <span className="model-summary">{summary}</span>}
       <Icon name="chevD" className="cd" />
-      {open && (
-        <div ref={pickerRef} className="model-picker" style={{ left: pos.left, bottom: pos.bottom, "--mp-max-h": `${pos.maxH}px` } as React.CSSProperties} onClick={(e) => e.stopPropagation()}>
+      {open && createPortal(
+        <div ref={pickerRef} className="model-picker" style={{ ...pickerStyle, "--mp-max-h": `${maxH}px` } as React.CSSProperties} onClick={(e) => e.stopPropagation()}>
           {editing ? (
             <div className="model-picker-view">
               <div className="mp-head">
@@ -589,12 +617,14 @@ function ModelPicker({
                 />
               </div>
               <div className="mp-body">
+                {/* Auto (judge-picked model) hidden for now — bring back later.
                 <div className={"model-item auto" + (selected === "auto" ? " active" : "")} onClick={() => pick("auto")}>
                   <Icon name="infinity" className="model-item-ico" />
                   <span className="model-item-name">Auto</span>
                   <span className="model-item-sum">picks a model for you</span>
                   {selected === "auto" && <Icon name="check" className="model-item-check" />}
                 </div>
+                */}
                 {filtered.length === 0 && <div className="model-item dim">No matches</div>}
                 {byProvider.map(([provName, list]) => (
                   <React.Fragment key={provName}>
@@ -625,7 +655,8 @@ function ModelPicker({
               </div>
             </div>
           )}
-        </div>
+        </div>,
+        document.body
       )}
     </span>
   );

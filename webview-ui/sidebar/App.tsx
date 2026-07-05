@@ -621,10 +621,9 @@ export function App() {
   // Pending in-chat approval requests, keyed by conversation id.
   const [approvals, setApprovals] = React.useState<Record<string, ApprovalRequestInfo[]>>({});
   const [reviewOpen, setReviewOpen] = React.useState(false);
-  // Editing an earlier user message: index of that turn + its edit-local model/mode.
+  // Editing an earlier user message: index of that turn. The edit composer
+  // shares the global model/mode selection (one selection for all composers).
   const [editingIndex, setEditingIndex] = React.useState<number | null>(null);
-  const [editModel, setEditModel] = React.useState("");
-  const [editMode, setEditMode] = React.useState<Mode>("agent");
   // Pending edit awaiting the revert-confirm dialog. `restore` = return the
   // message to the bottom composer instead of resending it.
   const [revertPrompt, setRevertPrompt] = React.useState<{ index: number; text: string; attachments: Attachment[]; restore?: boolean } | null>(null);
@@ -891,7 +890,7 @@ export function App() {
           force();
           break;
         case "modelSelected":
-          setSelectedModel(msg.model || "auto");
+          setSelectedModel(msg.model || ""); // auto hidden for now
           break;
         case "configState":
           setPersonas(msg.personas || []);
@@ -1102,16 +1101,15 @@ export function App() {
   React.useEffect(() => {
     if (editingIndex === null) return;
     const h = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest(".msg.user.editing, .modal-overlay")) setEditingIndex(null);
+      // Portaled dropdowns (model picker / mode menu) live in document.body.
+      if (!(e.target as HTMLElement).closest(".msg.user.editing, .modal-overlay, .model-picker, .mode-dropdown")) setEditingIndex(null);
     };
     document.addEventListener("mousedown", h);
     return () => document.removeEventListener("mousedown", h);
   }, [editingIndex]);
 
-  const startEdit = (index: number, turn: UserTurn) => {
+  const startEdit = (index: number, _turn: UserTurn) => {
     setEditingIndex(index);
-    setEditModel(turn.model || selectedModel);
-    setEditMode((turn.mode as Mode) || mode);
   };
 
   // Resend an edited earlier message. If there are file changes below it, ask the
@@ -1147,15 +1145,12 @@ export function App() {
   const commitEdit = (index: number, text: string, attachments: Attachment[], revertFiles: boolean) => {
     const s = sessionFor(activeIdRef.current);
     // Drop this turn and everything after it, then append the edited message.
-    s.turns = [...s.turns.slice(0, index), { role: "user", text, attachments: attachments.length ? attachments : undefined, model: editModel, mode: editMode }];
+    s.turns = [...s.turns.slice(0, index), { role: "user", text, attachments: attachments.length ? attachments : undefined, model: selectedModel, mode }];
     setEditingIndex(null);
     setRevertPrompt(null);
-    // Apply the edited model/mode as the active selection too.
-    if (editModel && editModel !== selectedModel) { setSelectedModel(editModel); post({ type: "selectModel", model: editModel }); }
-    if (editMode !== mode) { setMode(editMode); post({ type: "setMode", mode: editMode }); }
     pinTopRef.current = true;
     force();
-    post({ type: "sendMessage", text, attachments: attachments.length ? attachments : undefined, fromIndex: index, model: editModel, mode: editMode, revertFiles });
+    post({ type: "sendMessage", text, attachments: attachments.length ? attachments : undefined, fromIndex: index, model: selectedModel, mode, revertFiles });
   };
 
   // Switch to agent mode and kick off implementation of a written plan.
@@ -1370,12 +1365,18 @@ export function App() {
                         initialText={turn.text}
                         initialAttachments={turn.attachments}
                         focusKey={`edit-${index}`}
-                        mode={editMode}
-                        onMode={setEditMode}
+                        mode={mode}
+                        onMode={(m) => {
+                          setMode(m);
+                          post({ type: "setMode", mode: m });
+                        }}
                         models={models}
                         modelList={modelList}
-                        selectedModel={editModel}
-                        onSelectModel={setEditModel}
+                        selectedModel={selectedModel}
+                        onSelectModel={(m) => {
+                          setSelectedModel(m);
+                          post({ type: "selectModel", model: m });
+                        }}
                         onSaveModelOptions={(modelId, options) => {
                           setModelList((prev) => prev.map((m) => (m.id === modelId ? { ...m, options } : m)));
                           post({ type: "saveModelOptions", modelId, options });

@@ -839,7 +839,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** Whether a model id maps to a managed local llama.cpp model. */
   private _localModel(modelId: string) {
-    return this.featureStore.get().llamacppModels.find((m) => m.id === modelId);
+    const bare = stripModelScope(modelId);
+    return this.featureStore.get().llamacppModels.find((m) => m.id === modelId || m.id === bare);
   }
 
   /**
@@ -1021,8 +1022,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const judge = features.autoJudgeModel || candidates[0];
     try {
       const jprov = await this._resolveProviderForModel(judge);
-      const picked = await pickModel(jprov.baseUrl, jprov.apiKey, judge, candidates, task, jprov.anthropic);
+      // Local judge whose server isn't running would need a full model load just
+      // to route — not worth it; fall back to the first candidate instead.
+      const judgeIsLocal = !!this._localModel(judge);
+      if (judgeIsLocal && !isRunning(stripModelScope(judge))) return candidates[0];
+      if (!jprov.oauthKind && !jprov.baseUrl) return candidates[0]; // unroutable judge
+      const picked = await pickModel(jprov.baseUrl, jprov.apiKey, jprov.model, candidates, task, jprov.anthropic, jprov.oauthKind);
       if (picked && candidates.includes(picked)) return picked;
+      // Judge may reply with a bare model id (no provider scope) — match it.
+      const scoped = candidates.find((c) => stripModelScope(c) === stripModelScope(picked));
+      if (scoped) return scoped;
     } catch {
       // fall through to default
     }
@@ -1079,12 +1088,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     const allIds = fetched.flatMap((f) => f.ids);
     const modelList = this._buildModelList(fetched);
-    // Selected model vanished (e.g. account disabled) -> fall back to auto.
+    // Selected model vanished (e.g. account disabled) or is "auto" (hidden for
+    // now) -> fall back to the first enabled model.
     const settings = this.settingsManager.getSettings();
-    if (settings.model && settings.model !== "auto" && !modelList.some((m) => m.id === settings.model)) {
-      settings.model = "auto";
+    if (settings.model === "auto" || (settings.model && !modelList.some((m) => m.id === settings.model))) {
+      settings.model = modelList[0]?.id || "";
       await this.settingsManager.saveSettings(settings);
-      this._view?.webview.postMessage({ type: "modelSelected", model: "auto" });
+      this._view?.webview.postMessage({ type: "modelSelected", model: settings.model });
     }
     this._view?.webview.postMessage({ type: "modelsFetched", models: allIds, modelList });
   }
@@ -1165,10 +1175,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (edit?.mode) this._currentMode = edit.mode as Mode;
 
     const settings = this.settingsManager.getSettings();
-    // Auto mode: let a judge model pick the best enabled model for this task.
     let modelId = settings.model;
-    if (modelId === "auto") {
-      modelId = await this._resolveAutoModel(text);
+    // Auto mode is hidden for now; a lingering "auto" selection (or empty)
+    // resolves to the first enabled model. (Judge-based routing kept in
+    // _resolveAutoModel for when Auto returns.)
+    if (modelId === "auto" || !modelId) {
+      modelId = this._buildModelList([]).find((m) => m.id !== "auto")?.id || modelId;
     }
     // Resolve connection details without starting a local server yet — we want
     // the chat UI to show a "loading model" state while it boots (below).
@@ -1286,15 +1298,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       // Local model not yet running → boot it now, showing a loading state in the
       // chat (selecting a model never loads it; only sending a message does).
       const local = this._localModel(modelId);
-      if (local && !isRunning(local.id)) {
-        emit({ type: "shell-notify", message: `Loading ${local.name}…` });
-        try {
-          await ensureLoaded(local, features.llamacppConfig);
-        } catch (e: any) {
-          emit({ type: "error", message: `Failed to load ${local.name}: ${e?.message || e}` });
-          emit({ type: "run-status", status: "error" });
-          return; // `finally` clears the session + persists.
+      if (local) {
+        if (!isRunning(local.id)) {
+          emit({ type: "shell-notify", message: `Loading ${local.name}…` });
+          try {
+            await ensureLoaded(local, features.llamacppConfig);
+          } catch (e: any) {
+            emit({ type: "error", message: `Failed to load ${local.name}: ${e?.message || e}` });
+            emit({ type: "run-status", status: "error" });
+            return; // `finally` clears the session + persists.
+          }
         }
+        // The server binds a random port each load — resolve the URL only now.
+        prov.baseUrl = serverUrlFor(local, features.llamacppConfig);
       }
 
       // Generate a short AI title once the provider/server is ready (local

@@ -13,7 +13,7 @@ import { listModels } from "../agent/provider";
 import { renderWebviewHtml } from "./webviewHtml";
 import { FeatureStore, MODEL_CATALOG } from "../stores/featureStore";
 import { listRules, listSkills } from "../context/workspaceContext";
-import { mcpManager, searchMcpRegistry } from "../integrations/mcpClient";
+import { mcpManager } from "../integrations/mcpClient";
 import { BUILTIN_PERSONAS } from "../agent/personas";
 import { getStatus, onIndexStatus, buildIndex, deleteIndex, EMBED_MODELS } from "../agent/semanticIndex";
 import { indexDocSource, deleteDocIndex, onDocsStatus, getDocsStatus, getDocLogs, type DocSource } from "../agent/docsIndex";
@@ -234,15 +234,6 @@ export class SettingsPanel {
           case "resetStorage":
             await this._resetStorage();
             break;
-          case "mcpRegistrySearch": {
-            try {
-              const servers = await searchMcpRegistry(message.query || "");
-              this._panel.webview.postMessage({ type: "mcpRegistryResults", servers });
-            } catch (err: any) {
-              this._panel.webview.postMessage({ type: "mcpRegistryResults", servers: [], error: String(err?.message || err) });
-            }
-            break;
-          }
           case "saveProviderKey":
             await this.settingsManager.setProviderKey(message.providerId, message.apiKey ?? "");
             this.featureStore.notifyChanged();

@@ -9,8 +9,7 @@
 
 import * as React from "react";
 import { Icon } from "../../shared/icons";
-import { vscode } from "../../shared/vscode";
-import { FeatureConfig, McpServerConfig, McpStatus, uid } from "../features";
+import { FeatureConfig, McpServerConfig, McpStatus } from "../features";
 import { Toggle } from "./Toggle";
 
 export function McpPanel({
@@ -26,7 +25,6 @@ export function McpPanel({
 }) {
   // null = closed; { index: -1 } = adding a new server; otherwise editing that index.
   const [editing, setEditing] = React.useState<{ index: number; draft: McpServerConfig } | null>(null);
-  const [tab, setTab] = React.useState<"installed" | "marketplace">("installed");
 
   const remove = (i: number) => {
     setFeatures({ mcpServers: features.mcpServers.filter((_, idx) => idx !== i) });
@@ -51,27 +49,14 @@ export function McpPanel({
 
   const statusFor = (name: string) => status.find((s) => s.name === name);
 
-  // One-click install from the marketplace: append the derived config and reconnect.
-  const install = (cfg: McpServerConfig) => {
-    const name = features.mcpServers.some((s) => s.name === cfg.name) ? `${cfg.name}-${uid("").slice(0, 4)}` : cfg.name;
-    setFeatures({ mcpServers: [...features.mcpServers, { ...cfg, name }] });
-    setTimeout(onSync, 0);
-  };
-
   return (
     <>
       <h1 className="page-title">Tools &amp; MCPs</h1>
 
-      <div className="sub-tabs">
-        <button className={"sub-tab" + (tab === "installed" ? " active" : "")} onClick={() => setTab("installed")}>Installed</button>
-        <button className={"sub-tab" + (tab === "marketplace" ? " active" : "")} onClick={() => setTab("marketplace")}>Marketplace</button>
-      </div>
-
-      {tab === "installed" && (<>
       <div className="section-label">MCP Servers</div>
-      <p className="panel-hint">Connected Model Context Protocol servers and the tools they expose. Browse the <button className="link-btn" onClick={() => setTab("marketplace")}>Marketplace</button> to install with one click.</p>
+      <p className="panel-hint">Connected Model Context Protocol servers and the tools they expose.</p>
       {features.mcpServers.length === 0 && (
-        <div className="empty-card">No MCP servers yet. Add one or install from the Marketplace.</div>
+        <div className="empty-card">No MCP servers yet. Add one to get started.</div>
       )}
       {features.mcpServers.map((srv, i) => {
         const st = statusFor(srv.name);
@@ -118,11 +103,6 @@ export function McpPanel({
           Reconnect
         </button>
       </div>
-      </>)}
-
-      {tab === "marketplace" && (
-        <McpMarketplace installedNames={new Set(features.mcpServers.map((s) => s.name))} onInstall={install} />
-      )}
 
       {editing && (
         <McpModal
@@ -173,154 +153,5 @@ function McpModal({ server, isNew, onClose, onSave }: { server: McpServerConfig;
         </div>
       </div>
     </div>
-  );
-}
-
-// Marketplace: registry.modelcontextprotocol.io
-interface RegistryPackage {
-  registryType?: string;
-  identifier?: string;
-  version?: string;
-  runtimeHint?: string;
-  transport?: { type?: string };
-  runtimeArguments?: { type?: string; name?: string; value?: string }[];
-  packageArguments?: { type?: string; name?: string; value?: string }[];
-  environmentVariables?: { name?: string; description?: string; isRequired?: boolean; isSecret?: boolean }[];
-}
-interface RegistryServer {
-  name: string;
-  title?: string;
-  description?: string;
-  version?: string;
-  packages?: RegistryPackage[];
-}
-
-/** Default runtime command for a registry package type. */
-function runtimeFor(pkg: RegistryPackage): string {
-  if (pkg.runtimeHint) return pkg.runtimeHint;
-  switch (pkg.registryType) {
-    case "npm": return "npx";
-    case "pypi": return "uvx";
-    case "oci": return "docker";
-    case "nuget": return "dnx";
-    default: return "npx";
-  }
-}
-
-/** Build an args list from registry argument descriptors (positional/named values only). */
-function argValues(args?: { type?: string; name?: string; value?: string }[]): string[] {
-  if (!args) return [];
-  const out: string[] = [];
-  for (const a of args) {
-    if (a.name) out.push(a.name);
-    if (a.value) out.push(a.value);
-  }
-  return out;
-}
-
-/**
- * Derive a runnable stdio McpServerConfig from a registry server, or null if it
- * has no installable stdio package (e.g. remote-only servers).
- */
-function configFromRegistry(srv: RegistryServer): McpServerConfig | null {
-  const pkg = (srv.packages || []).find((p) => (p.transport?.type ?? "stdio") === "stdio" && p.identifier);
-  if (!pkg) return null;
-  const runtime = runtimeFor(pkg);
-  const args: string[] = [...argValues(pkg.runtimeArguments)];
-  // npx/dnx default to a non-interactive install flag, then the package id.
-  if (runtime === "npx") args.push("-y");
-  if (pkg.registryType === "oci") args.push("run", "-i", "--rm");
-  args.push(pkg.identifier!);
-  args.push(...argValues(pkg.packageArguments));
-  const env: Record<string, string> = {};
-  for (const e of pkg.environmentVariables ?? []) if (e.name) env[e.name] = "";
-  const shortName = srv.name.split("/").pop() || srv.name;
-  return {
-    name: shortName,
-    transport: "stdio",
-    command: runtime,
-    args,
-    env: Object.keys(env).length ? env : undefined,
-    enabled: true,
-  };
-}
-
-function McpMarketplace({ installedNames, onInstall }: { installedNames: Set<string>; onInstall: (cfg: McpServerConfig) => void }) {
-  const [query, setQuery] = React.useState("");
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const [results, setResults] = React.useState<RegistryServer[]>([]);
-
-  // The registry fetch runs in the extension host (webview CSP blocks direct fetch).
-  const search = React.useCallback((q: string) => {
-    setLoading(true);
-    setError("");
-    vscode.postMessage({ type: "mcpRegistrySearch", query: q.trim() });
-  }, []);
-
-  React.useEffect(() => {
-    const handler = (e: MessageEvent) => {
-      const m = e.data;
-      if (m?.type === "mcpRegistryResults") {
-        setLoading(false);
-        setResults(m.servers || []);
-        setError(m.error || "");
-      }
-    };
-    window.addEventListener("message", handler);
-    search("");
-    return () => window.removeEventListener("message", handler);
-  }, [search]);
-
-  return (
-    <>
-      <div className="section-label">Marketplace</div>
-      <p className="panel-hint">Search the official <code>registry.modelcontextprotocol.io</code> and install a server with one click. Servers with required environment variables are added with empty values — fill them in on the Installed tab.</p>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <input
-          type="search"
-          value={query}
-          placeholder="e.g. filesystem, github, playwright"
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") search(query); }}
-          style={{ flex: 1 }}
-        />
-        <button className="btn-primary" onClick={() => search(query)} disabled={loading}>
-          {loading ? "Searching…" : "Search"}
-        </button>
-      </div>
-      {error && <div className="fc-error">{error}</div>}
-      {!loading && results.length === 0 && !error && <div className="empty-card">No servers found.</div>}
-      {results.map((srv) => {
-        const cfg = configFromRegistry(srv);
-        const shortName = srv.name.split("/").pop() || srv.name;
-        const installed = installedNames.has(shortName);
-        return (
-          <div className="feature-card" key={srv.name}>
-            <div className="fc-head">
-              <div className="fc-title-input" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <Icon name="link" size={14} />
-                <span>{srv.title || shortName}</span>
-                {srv.version && <span className="badge-tag glob">v{srv.version}</span>}
-              </div>
-              {installed ? (
-                <span className="badge-tag glob">added</span>
-              ) : cfg ? (
-                <button className="btn-primary sm" onClick={() => onInstall(cfg)}>
-                  <Icon name="plus" size={13} /> Install
-                </button>
-              ) : (
-                <span className="badge-tag" title="No stdio package — remote/unsupported">remote</span>
-              )}
-            </div>
-            <div className="fc-body">
-              {srv.description && <div className="row-desc">{srv.description}</div>}
-              {cfg && <div className="row-desc" style={{ marginTop: 6, opacity: 0.7, fontFamily: "var(--vscode-editor-font-family, monospace)" }}>{cfg.command} {(cfg.args || []).join(" ")}</div>}
-              <div className="row-desc" style={{ marginTop: 4, opacity: 0.6 }}>{srv.name}</div>
-            </div>
-          </div>
-        );
-      })}
-    </>
   );
 }

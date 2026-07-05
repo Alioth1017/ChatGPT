@@ -19,7 +19,8 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  model: "auto",
+  // Auto hidden for now (bring back later): "" resolves to first enabled model.
+  model: "",
   // 0 = don't send max_tokens; the model decides when to stop.
   maxResponseLength: 0,
   enableWorkspaceContext: true,

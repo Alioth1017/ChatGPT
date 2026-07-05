@@ -220,7 +220,7 @@ export function LlamacppPanel({
                   <Icon name="model" size={14} />
                   <span>{m.name}</span>
                   {isLoading && <span className="badge-tag loading"><span className="llama-spinner" /> loading…</span>}
-                  {isRunning && !isLoading && <span className="badge-tag always">running :{m.port}</span>}
+                  {isRunning && !isLoading && <span className="badge-tag always">running</span>}
                 </div>
                 <label className="fc-inline" title="Load this model automatically on startup">
                   <input

@@ -35,14 +35,35 @@ const KEY = "ocursor.conversations";
 const ACTIVE_KEY = "ocursor.activeConversation";
 
 export class ConversationStore {
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(private readonly context: vscode.ExtensionContext) {
+    void this.migrateFromGlobal();
+  }
+
+  /** workspaceState = per-workspace storage; VS Code scopes it for us. */
+  private get state(): vscode.Memento {
+    return this.context.workspaceState;
+  }
+
+  /** One-time: move old globalState conversations into this workspace. */
+  private async migrateFromGlobal(): Promise<void> {
+    const old = this.context.globalState.get<Conversation[]>(KEY);
+    if (!old?.length || this.state.get<Conversation[]>(KEY)?.length) {
+      if (old) await this.context.globalState.update(KEY, undefined);
+      return;
+    }
+    await this.state.update(KEY, old);
+    const active = this.context.globalState.get<string>(ACTIVE_KEY);
+    if (active) await this.state.update(ACTIVE_KEY, active);
+    await this.context.globalState.update(KEY, undefined);
+    await this.context.globalState.update(ACTIVE_KEY, undefined);
+  }
 
   private all(): Conversation[] {
-    return this.context.globalState.get<Conversation[]>(KEY, []);
+    return this.state.get<Conversation[]>(KEY, []);
   }
 
   private async persist(list: Conversation[]): Promise<void> {
-    await this.context.globalState.update(KEY, list);
+    await this.state.update(KEY, list);
   }
 
   list(): ConversationSummary[] {
@@ -57,11 +78,11 @@ export class ConversationStore {
   }
 
   getActiveId(): string | undefined {
-    return this.context.globalState.get<string>(ACTIVE_KEY);
+    return this.state.get<string>(ACTIVE_KEY);
   }
 
   async setActiveId(id: string | undefined): Promise<void> {
-    await this.context.globalState.update(ACTIVE_KEY, id);
+    await this.state.update(ACTIVE_KEY, id);
   }
 
   async create(personaId?: string): Promise<Conversation> {

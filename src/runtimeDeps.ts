@@ -19,6 +19,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as zlib from "zlib";
 import * as crypto from "crypto";
+import { pathToFileURL } from "url";
 
 const REGISTRY = "https://registry.npmjs.org";
 
@@ -250,6 +251,32 @@ export function ensureRuntimeDeps(): Promise<boolean> {
     })();
   }
   return readyP;
+}
+
+/** Resolve a package's ESM entry point from its package.json. */
+function entryOf(pkg: any): string {
+  const pick = (v: any): string | undefined => {
+    if (typeof v === "string") return v;
+    if (v && typeof v === "object") return pick(v.import ?? v.node ?? v.default ?? v.require);
+    return undefined;
+  };
+  return pick(pkg.exports?.["."] ?? pkg.exports) || pkg.module || pkg.main || "index.js";
+}
+
+/**
+ * Import a runtime dep. In production the extension host's ESM resolver can't
+ * see runtime-deps/node_modules (the CJS require hook doesn't apply to
+ * import()), so we resolve the entry file ourselves and import it by file URL.
+ */
+export async function importRuntimeDep<T = any>(name: string): Promise<T> {
+  if (!(await ensureRuntimeDeps())) throw new Error("runtime deps unavailable");
+  try {
+    return await import(name); // dev: real node_modules next to us
+  } catch { /* fall back to runtime-deps dir */ }
+  if (!rootDir) throw new Error("runtime deps not initialized");
+  const dir = path.join(rootDir, "node_modules", ...name.split("/"));
+  const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+  return await import(pathToFileURL(path.join(dir, entryOf(pkg))).href);
 }
 
 // Self-check: OPENCURSOR_SELFCHECK=1 node -e "require('./dist/extension.js')"

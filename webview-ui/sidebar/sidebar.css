@@ -676,7 +676,7 @@ body {
 .pill .cd { width: 11px; height: 11px; }
 .pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.mode-dropdown { position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 150px; background: var(--dropdown-bg); border: 1px solid var(--dropdown-border); border-radius: 8px; padding: 3px; box-shadow: 0 8px 24px var(--shadow); z-index: 60; animation: pop-up .12s ease; }
+.mode-dropdown { position: fixed; min-width: 150px; background: var(--dropdown-bg); border: 1px solid var(--dropdown-border); border-radius: 8px; padding: 3px; box-shadow: 0 8px 24px var(--shadow); z-index: 200; animation: pop-up .12s ease; }
 .mode-item { display: flex; align-items: center; gap: 7px; height: 26px; padding: 0 7px; border-radius: 5px; font-size: 12px; color: var(--fg); cursor: pointer; }
 .mode-item:hover { background: var(--hover); }
 .mode-item .mi-icon { display: inline-flex; flex: 0 0 auto; color: var(--fg-dim); }
