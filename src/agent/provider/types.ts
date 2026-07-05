@@ -1,0 +1,54 @@
+/*
+ * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
+ *
+ * This file is part of OpenCursor — AI coding agent chat inside VS Code.
+ * https://github.com/PawanOsman/OpenCursor
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
+import type { WireMessage, ToolSchema } from "../types";
+import type { OAuthKind } from "../oauth/types";
+
+export interface ModelInfo {
+  id: string;
+}
+
+/** Per-model tunable params (reasoning effort, extended thinking). */
+export interface ModelParams {
+  reasoningEffort?: string;
+  /** Thinking mode: "disabled" | "adaptive" | "enabled" (Anthropic). */
+  thinking?: string;
+  /** Selected context window (e.g. "200k", "1m"). "1m" enables the Anthropic beta. */
+  maxContext?: string;
+}
+
+/** Optional sampling / generation parameters. Null/empty values are omitted. */
+export interface SamplingParams {
+  topP?: number | null;
+  topK?: number | null;
+  frequencyPenalty?: number | null;
+  presencePenalty?: number | null;
+  seed?: number | null;
+  stopSequences?: string[];
+}
+
+export interface StreamChatOpts {
+  apiBaseUrl: string;
+  apiKey: string;
+  model: string;
+  messages: WireMessage[];
+  tools?: ToolSchema[];
+  temperature?: number;
+  maxTokens?: number;
+  sampling?: SamplingParams;
+  modelParams?: ModelParams;
+  anthropic?: boolean;
+  /** OAuth account provider (Claude Code / Codex) — overrides apiBaseUrl/apiKey. */
+  oauthKind?: OAuthKind;
+  signal: AbortSignal;
+  /** Max total attempts per request (default 3). */
+  maxRetries?: number;
+  /** Notified before each backoff sleep when a transient error is retried. */
+  onRetry?: (attempt: number, max: number, delayMs: number, error: string) => void;
+}

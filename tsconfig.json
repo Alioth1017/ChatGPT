@@ -1,28 +1,23 @@
 {
-	"compilerOptions": {
-		"target": "es2022",
-		"module": "ESNext",
-		"strict": true,
-		"declaration": true,
-		"removeComments": true,
-		"emitDecoratorMetadata": true,
-		"experimentalDecorators": true,
-		"allowSyntheticDefaultImports": true,
-		"sourceMap": true,
-		"outDir": "./dist",
-		"baseUrl": "./",
-		"paths": {
-			"@/*": ["src/*"]
-		},
-		"incremental": true,
-		"moduleResolution": "node",
-		"skipLibCheck": true,
-		"strictNullChecks": false,
-		"noImplicitAny": false,
-		"strictBindCallApply": false,
-		"forceConsistentCasingInFileNames": false,
-		"noFallthroughCasesInSwitch": false
-	},
-	"include": ["src"],
-	"exclude": ["node_modules", "dist"]
+    "compilerOptions": {
+        "module": "Node16",
+        "target": "ES2022",
+        "lib": [
+            "ES2022"
+        ],
+        "types": [
+            "node",
+            "mocha"
+        ],
+        "sourceMap": true,
+        "rootDir": "src",
+        "skipLibCheck": true, /* skip type-checking of declaration files (e.g. pdfjs-dist DOM types) */
+        "strict": true, /* enable all strict type-checking options */
+        /* Additional Checks */
+        // "noImplicitReturns": true, /* Report error when not all code paths in function return a value. */
+        // "noFallthroughCasesInSwitch": true, /* Report errors for fallthrough cases in switch statement. */
+        // "noUnusedParameters": true,  /* Report errors on unused parameters. */
+    },
+    "include": ["src"],
+    "exclude": ["webview-ui", "node_modules", "dist", "out"]
 }
