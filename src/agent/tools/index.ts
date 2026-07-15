@@ -26,6 +26,8 @@ export {
   setSubagentRunner,
   setQuestionAsker,
   disposeShellSession,
+  toolTimeoutMs,
+  withToolTimeout,
   type TodoItem,
 } from "./shared";
 

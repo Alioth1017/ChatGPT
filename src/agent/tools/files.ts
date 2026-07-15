@@ -93,11 +93,11 @@ export const listDirTool = defineTool("ListDir", false, async (input) => {
 });
 
 // ---- Glob ----
-export const globTool = defineTool("Glob", false, async (input) => {
+export const globTool = defineTool("Glob", false, async (input, abortSignal) => {
   const root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
   // Include ignored dirs so patterns like "**/node_modules/**" can match.
   const all: string[] = [];
-  await walk(root, all, 0, true);
+  await walk(root, all, 0, true, abortSignal);
   // Prepend "**/" when the pattern isn't already rooted (schema behavior).
   let pattern: string = String(input.glob_pattern ?? "");
   if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
@@ -111,10 +111,10 @@ export const globTool = defineTool("Glob", false, async (input) => {
 });
 
 // ---- FileSearch (fuzzy filename search) ----
-export const fileSearchTool = defineTool("FileSearch", false, async (input) => {
+export const fileSearchTool = defineTool("FileSearch", false, async (input, abortSignal) => {
   const root = getWorkspaceRoot();
   const all: string[] = [];
-  await walk(root, all, 0);
+  await walk(root, all, 0, false, abortSignal);
   const q = String(input.query || "").toLowerCase();
   const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
   const scored = rel

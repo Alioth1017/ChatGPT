@@ -64,14 +64,27 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
     args.push("--", input.pattern, target);
 
     const out = await new Promise<string>((res) => {
-      const c = spawn("rg", args, { cwd: root, signal: abortSignal });
+      let settled = false;
       let o = "";
-      c.stdout.on("data", (d) => (o += d));
-      c.on("error", () => res("(grep failed)"));
+      const c = spawn("rg", args, { cwd: root, signal: abortSignal });
+      const finish = (v: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        res(v);
+      };
+      // Hard kill hung rg even if AbortSignal is missing/ignored.
+      const timer = setTimeout(() => {
+        try { c.kill("SIGTERM"); } catch { /* ignore */ }
+        finish(o ? o.slice(0, 50_000) + "\n(grep timed out)" : "(grep timed out)");
+      }, 25_000);
+      c.stdout?.on("data", (d) => (o += d));
+      c.stderr?.on("data", () => { /* ignore */ });
+      c.on("error", () => finish("(grep failed)"));
       c.on("close", () => {
         let lines = o.split("\n").filter(Boolean);
         if (skip) lines = lines.slice(skip);
-        res(lines.slice(0, cap).join("\n") || "(no matches)");
+        finish(lines.slice(0, cap).join("\n") || "(no matches)");
       });
     });
     return { output: out };
@@ -80,7 +93,7 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   // Node fallback (no ripgrep available). Honor path/glob/type/-A/-B/-C/multiline.
   const scopeRoot = input.path ? safePath(input.path) : root;
   const all: string[] = [];
-  await walk(scopeRoot, all, 0);
+  await walk(scopeRoot, all, 0, false, abortSignal);
 
   const flags = input["-i"] ? "i" : "";
   const lineRe = new RegExp(input.pattern, flags);
@@ -94,6 +107,7 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   const countByFile: Record<string, number> = {};
   const order: string[] = [];
   for (const f of all.slice(0, 5000)) {
+    if (abortSignal?.aborted) return { output: "(grep aborted)" };
     const rel = path.relative(root, f).split(path.sep).join("/");
     if (globRe && !globRe.test(rel)) continue;
     if (typeExts && !typeExts.includes(path.extname(f).toLowerCase())) continue;

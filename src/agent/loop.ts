@@ -9,7 +9,7 @@
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
-import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, type AskQuestionItem, type ToolContext } from "./tools";
+import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
@@ -612,7 +612,40 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 				}
 				try {
-					const r = await tool.execute(input, signal, call.id, toolCtx);
+					// Per-tool hard timeout + linked abort so hung Shell/Grep/Glob
+					// cannot block the agent loop. Task/AskQuestion skip the timeout.
+					const limitMs = toolTimeoutMs(call.name);
+					const toolAc = new AbortController();
+					const onParentAbort = () => {
+						try { toolAc.abort(); } catch { /* ignore */ }
+					};
+					if (signal.aborted) onParentAbort();
+					else signal.addEventListener("abort", onParentAbort, { once: true });
+					// Abort the tool slightly before the race rejects so cleanup can run.
+					let toolTimer: ReturnType<typeof setTimeout> | undefined;
+					if (limitMs > 0) {
+						toolTimer = setTimeout(() => {
+							try { toolAc.abort(); } catch { /* ignore */ }
+						}, limitMs);
+					}
+					let r: Awaited<ReturnType<typeof tool.execute>>;
+					try {
+						r = await withToolTimeout(
+							tool.execute(input, toolAc.signal, call.id, toolCtx),
+							limitMs,
+							call.name,
+						);
+					} catch (e) {
+						const msg = e instanceof Error ? e.message : String(e);
+						r = {
+							output: msg.startsWith("timeout:")
+								? `error: ${msg}. The tool was aborted so the agent can continue — retry with a narrower scope or shorter command.`
+								: `error: ${msg}`,
+						};
+					} finally {
+						if (toolTimer) clearTimeout(toolTimer);
+						signal.removeEventListener("abort", onParentAbort);
+					}
 					const status: "completed" | "error" = r.output.startsWith("error:") ? "error" : "completed";
 					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, image: r.image };
 					// afterEdit hook on successful edits.

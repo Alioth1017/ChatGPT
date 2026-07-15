@@ -16,6 +16,80 @@ import type { SubagentRunner, QuestionAsker } from "./types";
 // Directories never walked/listed.
 export const IGNORE = new Set([".git", "node_modules", "dist", "out"]);
 
+// ---------------------------------------------------------------------------
+// Per-tool hard timeouts (ms). Prevents a hung Grep/Glob/Shell/etc. from
+// blocking the agent loop forever. Task/AskQuestion are excluded (own budgets).
+// ---------------------------------------------------------------------------
+export const TOOL_TIMEOUT_MS: Record<string, number> = {
+  // Shell/AwaitShell cap their own foreground wait (90s/120s); the outer
+  // timeout is a safety net above that so it never fires before the tool's.
+  Shell: 120_000,
+  AwaitShell: 150_000,
+  Grep: 30_000,
+  Glob: 30_000,
+  FileSearch: 20_000,
+  SemanticSearch: 45_000,
+  SearchDocs: 30_000,
+  ListDir: 15_000,
+  Read: 30_000,
+  ReadLints: 20_000,
+  WebSearch: 25_000,
+  WebFetch: 30_000,
+  StrReplace: 30_000,
+  Write: 30_000,
+  Delete: 15_000,
+  EditNotebook: 30_000,
+  CallMcpTool: 60_000,
+  FetchMcpResource: 45_000,
+  ListMcpResources: 20_000,
+  TodoWrite: 5_000,
+  TodoRead: 5_000,
+  WritePlan: 15_000,
+  SwitchMode: 5_000,
+};
+/** Default when a tool has no explicit entry. */
+export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+/** Tools that manage their own lifetime (user wait / nested agent). */
+export const NO_TOOL_TIMEOUT = new Set(["Task", "AskQuestion"]);
+
+/**
+ * Race a tool promise against a hard timeout. On timeout rejects with an Error
+ * whose message starts with "timeout:" so the loop can surface it cleanly.
+ * Does not cancel the underlying work by itself — pass a linked AbortSignal
+ * into the tool when possible (Shell/Grep honor it).
+ */
+export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  if (!ms || ms <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`timeout: ${label} exceeded ${Math.round(ms / 1000)}s`));
+    }, ms);
+    p.then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Resolve the hard timeout for a tool name (0 = none). */
+export function toolTimeoutMs(name: string): number {
+  if (NO_TOOL_TIMEOUT.has(name)) return 0;
+  return TOOL_TIMEOUT_MS[name] ?? DEFAULT_TOOL_TIMEOUT_MS;
+}
+
 // Stopwords for the keyword-based SemanticSearch fallback.
 export const STOP = new Set([
   "where", "what", "which", "does", "with", "this", "that", "have", "from",
@@ -101,8 +175,17 @@ export function firstDiffLine(before: string, after: string): number {
  * Recursively collect file paths under `dir` (depth-capped). IGNORE dirs
  * (.git/node_modules/dist/out) are skipped unless `includeIgnored` is true.
  */
-export async function walk(dir: string, out: string[], depth: number, includeIgnored = false): Promise<void> {
-  if (depth > 12) return;
+export async function walk(
+  dir: string,
+  out: string[],
+  depth: number,
+  includeIgnored = false,
+  signal?: AbortSignal,
+  /** Soft cap so huge trees cannot hang the tool forever. */
+  maxFiles = 50_000,
+): Promise<void> {
+  if (depth > 12 || out.length >= maxFiles) return;
+  if (signal?.aborted) return;
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -110,10 +193,11 @@ export async function walk(dir: string, out: string[], depth: number, includeIgn
     return;
   }
   for (const e of entries) {
+    if (signal?.aborted || out.length >= maxFiles) return;
     if (!includeIgnored && IGNORE.has(e.name)) continue;
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
-      await walk(full, out, depth + 1, includeIgnored);
+      await walk(full, out, depth + 1, includeIgnored, signal, maxFiles);
     } else {
       out.push(full);
     }
@@ -273,11 +357,18 @@ export function disposeShellSession(key: string): void {
 }
 
 /** Wait until the shell finishes, `pattern` matches its output, or `ms` elapses. */
-export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp): Promise<void> {
+export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const deadline = Date.now() + Math.max(0, ms);
     const tick = () => {
-      sh.pump?.();
+      try { sh.pump?.(); } catch { /* ignore */ }
+      if (signal?.aborted) {
+        if (!sh.done) {
+          sh.output += "\n(aborted)";
+          sh.done = true;
+        }
+        return resolve();
+      }
       if (sh.done || (pattern && pattern.test(sh.output)) || Date.now() >= deadline) return resolve();
       setTimeout(tick, 100);
     };
