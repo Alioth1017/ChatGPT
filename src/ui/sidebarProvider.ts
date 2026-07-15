@@ -228,34 +228,68 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "cancelSubagent":
-          // callId is globally unique; find the owning session and abort that child.
+          // callId is globally unique; abort tool/subagent and settle the card now.
           for (const [cid, s] of this._sessions) {
             const a = s.subagentAborts.get(data.callId);
-            if (!a) continue;
-            try { a(); } catch { /* ignore */ }
-            // Mark this Task card cancelled immediately so the spinner stops even if
-            // the child never emits a terminal run-status.
+            if (a) {
+              try { a(); } catch { /* ignore */ }
+              s.subagentAborts.delete(data.callId);
+            }
+            // Mark card settled immediately so spinner stops even if the worker
+            // never emits a terminal event (timeout / hung process).
+            let hit = false;
             s.turns = s.turns.map((turn) => {
               if (turn.role !== "assistant") return turn;
               let changed = false;
               const blocks = turn.blocks.map((b) => {
                 if (b.kind !== "tool" || b.callId !== data.callId) return b;
+                if (b.status !== "running" && b.subStatus !== "running") return b;
+                hit = true;
                 changed = true;
+                const timedOut = data.reason === "timeout";
                 return {
                   ...b,
-                  status: b.status === "running" ? ("error" as const) : b.status,
-                  result: b.result || "(cancelled)",
-                  subStatus: "cancelled" as const,
+                  status: "error" as const,
+                  result: b.result || (timedOut ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)` : "(cancelled)"),
+                  subStatus: (b.name === "Task" || b.name === "task" || b.subStatus)
+                    ? (timedOut ? "error" : "cancelled") as const
+                    : b.subStatus,
                 };
               });
               return changed ? { ...turn, blocks } : turn;
             });
+            if (!hit && !a) continue;
             this._persistTurnsNow(cid, s);
+            // Find tool name for a proper completed event.
+            let toolName = "Tool";
+            for (const turn of s.turns) {
+              if (turn.role !== "assistant") continue;
+              const b = turn.blocks.find((x) => x.kind === "tool" && x.callId === data.callId);
+              if (b && b.kind === "tool") { toolName = b.name; break; }
+            }
+            const resultMsg = data.reason === "timeout" ? "(timeout)" : "(cancelled)";
             this._view?.webview.postMessage({
               type: "agentEvent",
               convId: cid,
-              event: { type: "subagent-event", callId: data.callId, event: { type: "run-status", status: "cancelled" } },
+              event: {
+                type: "tool-call-completed",
+                callId: data.callId,
+                name: toolName,
+                status: "error",
+                result: resultMsg,
+              },
             });
+            if (toolName === "Task" || toolName === "task") {
+              this._view?.webview.postMessage({
+                type: "agentEvent",
+                convId: cid,
+                event: {
+                  type: "subagent-event",
+                  callId: data.callId,
+                  event: { type: "run-status", status: data.reason === "timeout" ? "error" : "cancelled" },
+                },
+              });
+            }
             break;
           }
           break;
@@ -1470,7 +1504,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         approve: (toolName, input, callId) => this._approveTool(convId, session, toolName, input, callId),
         customSubagents: features.subagents,
         subagentModel: features.subagentModel,
-        registerSubagentAbort: (callId, abort) => session.subagentAborts.set(callId, abort),
+        registerSubagentAbort: (callId, abort) => {
+          // Chain aborts (tool kill + nested Task child) so timeout fires both.
+          const prev = session.subagentAborts.get(callId);
+          session.subagentAborts.set(callId, () => {
+            try { prev?.(); } catch { /* ignore */ }
+            try { abort(); } catch { /* ignore */ }
+          });
+        },
         askUser: (callId, _header, _questions, sig) => this._askUser(session, callId, sig),
         onAfterRun: () => runHooks(features.hooks, "afterRun", { prompt: text }),
         onBeforeShell: (command) => runBlockingHooks(features.hooks, "beforeShell", { command }),

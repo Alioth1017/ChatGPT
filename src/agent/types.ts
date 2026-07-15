@@ -73,7 +73,7 @@ export type ProviderEvent =
 export type AgentEvent =
   | { type: "text-delta"; text: string }
   | { type: "thinking-delta"; text: string }
-  | { type: "tool-call-started"; callId: string; name: string; input: unknown }
+  | { type: "tool-call-started"; callId: string; name: string; input: unknown; timeoutMs?: number; startedAt?: number }
   // Live JSON-arg streaming for a started call (UI parses partial input).
   | { type: "tool-call-args"; callId: string; argsText: string }
   | { type: "tool-call-completed"; callId: string; name: string; status: "completed" | "error"; result: string; diff?: string; startLine?: number; endLine?: number }

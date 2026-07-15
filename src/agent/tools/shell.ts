@@ -27,6 +27,8 @@ const isWin = process.platform === "win32";
 const DEFAULT_BLOCK_MS = 15_000;
 const MAX_BLOCK_MS = 30_000;
 const MAX_AWAIT_MS = 45_000;
+/** Absolute hard wall even if block_until_ms is large / tool timeout is higher. */
+const SHELL_HARD_WALL_MS = 45_000;
 
 /** Build a notify_on_output config from the tool input, if present. */
 function buildNotify(input: any, ctx: any): ShellNotify | undefined {
@@ -246,22 +248,30 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
     };
   }
 
+  // Cap wait by tool abort + hard wall so Shell never outlives its countdown.
+  const waitMs = blockMs <= 0 ? 0 : Math.min(blockMs, SHELL_HARD_WALL_MS);
   try {
-    await waitForShell(sh, blockMs, undefined, abortSignal);
+    await waitForShell(sh, waitMs, undefined, abortSignal);
     try {
       sh.pump?.();
     } catch {
       /* ignore */
     }
 
-    // Timed out with no sentinel: do NOT leave a hung command poisoning the
-    // session — kill and respawn so the next Shell call is clean.
-    if (!sh.done && blockMs > 0) {
-      sh.output += `\n(timeout after ${blockMs}ms — session reset; re-run with a shorter command or block_until_ms=0 to background)`;
+    // Abort/timeout: kill session immediately so the loop is free.
+    if (abortSignal?.aborted && !sh.done) {
+      sh.output += "\n(aborted / timed out)";
       sh.done = true;
       sh.exitCode = sh.exitCode ?? 124;
       killSession();
-    } else if (!sh.done && blockMs === 0) {
+    } else if (!sh.done && waitMs > 0) {
+      // Timed out with no sentinel: do NOT leave a hung command poisoning the
+      // session — kill and respawn so the next Shell call is clean.
+      sh.output += `\n(timeout after ${waitMs}ms — session reset; re-run with a shorter command or block_until_ms=0 to background)`;
+      sh.done = true;
+      sh.exitCode = sh.exitCode ?? 124;
+      killSession();
+    } else if (!sh.done && waitMs === 0) {
       // Immediate background: keep pumping via interval until done/timeout later.
       const bgPump = setInterval(() => {
         try {

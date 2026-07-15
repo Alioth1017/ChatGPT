@@ -246,6 +246,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					});
 				bgSubagents.push(tracked);
 				void tracked.then((v) => { bgSettled[idx] = v; });
+				// Mark nested status running so UI countdown keeps ticking after parent tool completes.
+				if (callId) emit({ type: "subagent-event", callId, event: { type: "run-status", status: "running" } });
 				return `Launched ${title} in the background${callId ? ` (call ${callId})` : ""}. It will keep working and stream its results; you do not need to wait or poll for it. When all background subagents finish, their summaries will be delivered to you automatically and you can continue.`;
 			}
 			try {
@@ -537,9 +539,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					emit({ type: "thinking-delta", text: ev.text });
 				} else if (ev.type === "tool-call-start") {
 					// Surface the tool card the moment the model commits to a call.
+					// No startedAt yet — countdown begins when execute actually starts.
 					callIdByIndex.set(ev.index, ev.id);
 					argsByIndex.set(ev.index, "");
-					emit({ type: "tool-call-started", callId: ev.id, name: ev.name, input: {} });
+					const tMs = toolTimeoutMs(ev.name);
+					emit({
+						type: "tool-call-started",
+						callId: ev.id,
+						name: ev.name,
+						input: {},
+						timeoutMs: tMs > 0 ? tMs : undefined,
+					});
 				} else if (ev.type === "tool-call-args-delta") {
 					const id = callIdByIndex.get(ev.index);
 					const acc = (argsByIndex.get(ev.index) ?? "") + ev.delta;
@@ -642,8 +652,32 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// with {} would call tools with missing params — fail the call instead.
 					badArgs = true;
 				}
-				emit({ type: "tool-call-started", callId: call.id, name: call.name, input });
-				return { call, input, badArgs };
+				const tMs = toolTimeoutMs(call.name);
+				// Shell: countdown uses block_until_ms when shorter than tool budget.
+				let timeoutMs = tMs > 0 ? tMs : undefined;
+				if ((call.name === "Shell" || call.name === "AwaitShell") && !badArgs) {
+					const raw = typeof input?.block_until_ms === "number" ? input.block_until_ms : undefined;
+					if (raw !== undefined && raw > 0) {
+						const block = Math.min(raw, call.name === "Shell" ? 30_000 : 45_000);
+						timeoutMs = timeoutMs ? Math.min(timeoutMs, block) : block;
+					} else if (call.name === "Shell" && (raw === undefined || raw === null)) {
+						// Default foreground shell wait.
+						timeoutMs = timeoutMs ? Math.min(timeoutMs, 15_000) : 15_000;
+					}
+				}
+				// Task: use Task budget (foreground); bg still has BG_SUBAGENT_MAX_MS.
+				if (call.name === "Task" && input?.run_in_background === true) {
+					timeoutMs = BG_SUBAGENT_MAX_MS;
+				}
+				// Announce card + budget; startedAt set when exec actually begins.
+				emit({
+					type: "tool-call-started",
+					callId: call.id,
+					name: call.name,
+					input,
+					timeoutMs,
+				});
+				return { call, input, badArgs, timeoutMs };
 			});
 
 			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
@@ -741,39 +775,57 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 				}
 				try {
-					// Per-tool hard timeout + linked abort so hung Shell/Grep/Glob
-					// cannot block the agent loop. Task/AskQuestion skip the timeout.
-					const limitMs = toolTimeoutMs(call.name);
+					// Per-tool hard timeout + linked abort. On timeout: kill immediately
+					// and settle UI — never leave the card spinning "Working".
+					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(call.name);
 					const toolAc = new AbortController();
-					const onParentAbort = () => {
+					const killTool = () => {
 						try { toolAc.abort(); } catch { /* ignore */ }
 					};
+					// Register so UI countdown-0 / cancelSubagent can kill any tool.
+					if (registerSubagentAbort) {
+						registerSubagentAbort(call.id, killTool);
+					}
+					// Countdown clock starts now (not when the card was announced).
+					emit({
+						type: "tool-call-started",
+						callId: call.id,
+						name: call.name,
+						input,
+						timeoutMs: limitMs > 0 ? limitMs : undefined,
+						startedAt: Date.now(),
+					});
+					const onParentAbort = () => killTool();
 					if (signal.aborted) onParentAbort();
 					else signal.addEventListener("abort", onParentAbort, { once: true });
-					// Abort slightly before the race rejects so tools can clean up.
-					let toolTimer: ReturnType<typeof setTimeout> | undefined;
-					if (limitMs > 0) {
-						toolTimer = setTimeout(() => {
-							try { toolAc.abort(); } catch { /* ignore */ }
-						}, Math.max(500, limitMs - 400));
-					}
 					let r: Awaited<ReturnType<typeof tool.execute>>;
+					let timedOut = false;
 					try {
 						r = await withToolTimeout(
 							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
 							limitMs,
 							call.name,
+							() => {
+								timedOut = true;
+								killTool();
+								// Immediate UI settle on timeout — don't wait for tool cleanup.
+								results[i] = {
+									status: "error",
+									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+								};
+								finishUi(i);
+							},
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
 						try { toolAc.abort(); } catch { /* ignore */ }
+						const isTo = timedOut || msg.startsWith("timeout:");
 						r = {
-							output: msg.startsWith("timeout:")
-								? `error: ${msg}. Tool aborted - retry with a narrower scope or shorter command.`
+							output: isTo
+								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
 								: `error: ${msg}`,
 						};
 					} finally {
-						if (toolTimer) clearTimeout(toolTimer);
 						signal.removeEventListener("abort", onParentAbort);
 					}
 					const status: "completed" | "error" = r.output.startsWith("error:") ? "error" : "completed";
@@ -782,6 +834,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (status === "completed" && isEditTool && onAfterEdit) {
 						onAfterEdit(String(input?.path ?? ""));
 					}
+					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);
 				} catch (e) {
 					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };

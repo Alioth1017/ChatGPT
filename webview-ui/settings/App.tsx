@@ -103,6 +103,7 @@ const TOOL_TIMEOUT_DEFAULTS: { name: string; sec: number }[] = [
   { name: "TodoRead", sec: 5 },
   { name: "WritePlan", sec: 10 },
   { name: "SwitchMode", sec: 5 },
+  { name: "Task", sec: 360 },
 ];
 
 /** Search terms per section so the nav filter finds settings inside pages too. */

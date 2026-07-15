@@ -27,6 +27,7 @@ import {
   GitCommitHorizontal,
   Globe,
   BookOpen,
+  Copy,
   History as HistoryIcon,
   Image as ImageIcon,
   Infinity as InfinityIcon,
@@ -96,6 +97,7 @@ const MAP = {
   book: BookOpen,
   more: MoreHorizontal,
   download: Download,
+  copy: Copy,
 } satisfies Record<string, LucideIcon>;
 
 export type IconName = keyof typeof MAP;

@@ -227,6 +227,7 @@ function SubagentCard({ block, onOpen }: { block: ToolBlock; onOpen?: (callId: s
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
+        <TimeoutBadge block={block} />
         <span className="sub-steps">{running ? `${steps} steps…` : `${steps} steps`}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
@@ -323,6 +324,64 @@ function StatusIcon({ status }: { status: ToolBlock["status"] }) {
   return status === "completed" ? <Icon name="check" className="ok-icon" /> : <Icon name="close" className="err-icon" />;
 }
 
+/** Live countdown for a running tool. At 0: cancel/kill via host. */
+function useToolCountdown(block: ToolBlock): number | null {
+  const budget = block.timeoutMs && block.timeoutMs > 0 ? block.timeoutMs : 0;
+  const started = block.startedAt || 0;
+  const isTask = block.name === "Task" || block.name === "task";
+  const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
+  // Task: keep countdown while nested work is open (incl. bg after parent tool completed).
+  const running = isTask
+    ? !subDone && (block.status === "running" || block.subStatus === "running" || (!!block.subBlocks?.length && !subDone))
+    : block.status === "running";
+  const [left, setLeft] = React.useState<number | null>(() => {
+    if (!budget || !started || !running) return null;
+    return Math.max(0, Math.ceil((started + budget - Date.now()) / 1000));
+  });
+  const fired = React.useRef(false);
+  React.useEffect(() => {
+    fired.current = false;
+    // Wait until execute has stamped startedAt (budget alone is not enough).
+    if (!budget || !started || !running) {
+      setLeft(null);
+      return;
+    }
+    const tick = () => {
+      const sec = Math.max(0, Math.ceil((started + budget - Date.now()) / 1000));
+      setLeft(sec);
+      if (sec <= 0 && !fired.current) {
+        fired.current = true;
+        post({ type: "cancelSubagent", callId: block.callId, reason: "timeout" });
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 250);
+    return () => window.clearInterval(id);
+  }, [budget, started, running, block.callId, block.status, block.subStatus]);
+  if (!running || left == null) return null;
+  return left;
+}
+
+function formatCountdown(sec: number): string {
+  if (sec >= 60) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
+  }
+  return `${sec}s`;
+}
+
+function TimeoutBadge({ block }: { block: ToolBlock }) {
+  const left = useToolCountdown(block);
+  if (left == null) return null;
+  const urgent = left <= 5;
+  return (
+    <span className={"tool-timeout" + (urgent ? " urgent" : "") + (left === 0 ? " zero" : "")} title="Timeout remaining">
+      {left === 0 ? "timeout" : formatCountdown(left)}
+    </span>
+  );
+}
+
 function Diff({ diff }: { diff: string }) {
   const lines = diff.split("\n");
   const needsExpand = lines.length > 6;
@@ -380,6 +439,7 @@ export function ReadLine({ block }: { block: ToolBlock }) {
       </span>
       <span className="rname">Read {basename(i.path)}</span>
       <span className="rlines">{rangeTxt ? "L" + rangeTxt : ""}</span>
+      <TimeoutBadge block={block} />
       <span className="rstatus">
         <StatusIcon status={block.status} />
       </span>
@@ -535,7 +595,8 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
   const i = block.input || {};
   const meta = toolMeta(block.name, i);
   const isEdit = block.name === "edit_file" || block.name === "StrReplace" || block.name === "Write";
-  const [open, setOpen] = React.useState(isEdit);
+  const isShell = block.name === "run_terminal" || block.name === "Shell" || block.name === "AwaitShell";
+  const [open, setOpen] = React.useState(isEdit || isShell);
 
   const onHeaderClick = () => {
     if (isEdit) {
@@ -546,10 +607,12 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
   };
 
   const showBody = isEdit ? true : open;
+  const shellCmd = isShell ? String(i.command || meta.label || "") : "";
+  const shellParsed = isShell ? parseShellResult(block.result, shellCmd) : null;
 
   return (
-    <div className={"tool-card " + (isEdit ? "edit-card" : "compact-card")}>
-      <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact")} onClick={onHeaderClick}>
+    <div className={"tool-card " + (isEdit ? "edit-card" : "compact-card") + (isShell ? " shell-card" : "")}>
+      <div className={"tool-card-header " + (isEdit ? "edit-header" : "compact") + (isShell ? " shell-header" : "")} onClick={onHeaderClick}>
         <div className="left">
           {!isEdit && (
             <span className={"tchev" + (open ? " open" : "")}>
@@ -559,7 +622,14 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
           <span className="ticon">
             {isEdit ? <FileIcon path={i.path || ""} fallback={meta.icon} /> : <Icon name={meta.icon} />}
           </span>
-          <span className="label">{meta.label}</span>
+          {isShell ? (
+            <span className="shell-prompt-line" title={shellCmd}>
+              <span className="shell-prompt">$</span>
+              <span className="shell-cmd">{shellCmd || "…"}</span>
+            </span>
+          ) : (
+            <span className="label">{meta.label}</span>
+          )}
           {isEdit && block.diff && (() => {
             const s = diffStats(block.diff);
             return (
@@ -571,6 +641,8 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
           })()}
         </div>
         <div className="right">
+          {isShell && shellCmd ? <CopyCommandButton command={shellCmd} /> : null}
+          <TimeoutBadge block={block} />
           {!isEdit && <span className={"badge " + meta.cls}>{meta.badge}</span>}
           <StatusIcon status={block.status} />
         </div>
@@ -582,8 +654,18 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
           ) : isEdit && block.status === "running" ? (
             // Stream the code as the model writes it; swapped for the diff on completion.
             <pre className="tool-result streaming">{editPreview(block.name, i) || "Writing…"}</pre>
-          ) : block.name === "run_terminal" || block.name === "Shell" ? (
-            <pre className="terminal-output">{block.result ?? "Running…"}</pre>
+          ) : isShell && shellParsed ? (
+            <div className="shell-body">
+              {shellParsed.meta ? <div className="shell-meta">{shellParsed.meta}</div> : null}
+              <pre className="terminal-output">
+                {shellParsed.body || (block.status === "running" ? "Running…" : "")}
+              </pre>
+              {shellParsed.footer ? (
+                <div className={"shell-footer" + (shellParsed.ok === false ? " err" : shellParsed.ok ? " ok" : "")}>
+                  {shellParsed.footer}
+                </div>
+              ) : null}
+            </div>
           ) : (
             <pre className="tool-result">{block.status === "running" ? "Running…" : (block.result || "").slice(0, 4000)}</pre>
           )}
@@ -591,4 +673,92 @@ export function ToolCard({ block, onImplement, onOpenSubagent }: { block: ToolBl
       )}
     </div>
   );
+}
+
+function CopyCommandButton({ command }: { command: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const done = () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    };
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(command).then(done).catch(() => {
+        // fallback below
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = command;
+          ta.style.position = "fixed";
+          ta.style.left = "-9999px";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          done();
+        } catch { /* ignore */ }
+      });
+    } else {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = command;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      } catch { /* ignore */ }
+    }
+  };
+  return (
+    <button
+      type="button"
+      className={"shell-copy-btn" + (copied ? " copied" : "")}
+      title={copied ? "Copied" : "Copy command"}
+      aria-label={copied ? "Copied" : "Copy command"}
+      onClick={onCopy}
+    >
+      <Icon name={copied ? "check" : "copy"} size={12} />
+    </button>
+  );
+}
+
+/** Strip duplicated `$ command` lines from shell tool output for cleaner card body. */
+function parseShellResult(raw: string | undefined, command: string): {
+  meta: string;
+  body: string;
+  footer: string;
+  ok: boolean | null;
+} {
+  if (!raw) return { meta: "", body: "", footer: "", ok: null };
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  let meta = "";
+  let footer = "";
+  let ok: boolean | null = null;
+  const bodyLines: string[] = [];
+  const cmdNorm = command.trim();
+  for (const line of lines) {
+    if (!meta && /^\[shell\s/.test(line)) {
+      meta = line.replace(/^\[shell\s+/, "").replace(/\]\s*$/, "").trim();
+      continue;
+    }
+    if (/^\(exit_code=/.test(line) || /^\(still running/.test(line)) {
+      footer = line.replace(/^\(/, "").replace(/\)$/, "");
+      const m = line.match(/exit_code=(-?\d+)/);
+      if (m) ok = Number(m[1]) === 0;
+      continue;
+    }
+    // Drop the echo of the command (header already shows it).
+    const t = line.trim();
+    if (t === `$ ${cmdNorm}` || t === cmdNorm || (cmdNorm && t === `$ ${cmdNorm}`)) continue;
+    if (t.startsWith("$ ") && cmdNorm && t.slice(2).trim() === cmdNorm) continue;
+    bodyLines.push(line);
+  }
+  // Trim leading/trailing blank lines from body.
+  while (bodyLines.length && !bodyLines[0].trim()) bodyLines.shift();
+  while (bodyLines.length && !bodyLines[bodyLines.length - 1].trim()) bodyLines.pop();
+  return { meta, body: bodyLines.join("\n"), footer, ok };
 }

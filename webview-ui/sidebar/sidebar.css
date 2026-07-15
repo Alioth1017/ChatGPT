@@ -154,6 +154,123 @@ body {
 .tool-card-header .left .ticon svg { width: 14px; height: 14px; }
 .tool-card-header.compact .left .ticon svg { width: 12px; height: 12px; }
 .tool-card-header .left .label { font-family: "Cascadia Code", Consolas, monospace; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ---- Shell / Terminal card ---- */
+.tool-card.shell-card {
+  border-color: color-mix(in srgb, var(--accent, #4a9) 28%, var(--border-soft));
+  background: var(--bg);
+}
+.tool-card.shell-card .tool-card-header.shell-header {
+  height: auto;
+  min-height: 28px;
+  padding: 6px 8px;
+  align-items: flex-start;
+  gap: 8px;
+  background: color-mix(in srgb, var(--terminal-bg, var(--bg-dark)) 55%, var(--input-bg));
+}
+.tool-card.shell-card .tool-card-header .left {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 6px;
+}
+.tool-card.shell-card .tool-card-header .right {
+  flex: 0 0 auto;
+  align-items: center;
+  padding-top: 1px;
+}
+.shell-prompt-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.shell-prompt {
+  flex: 0 0 auto;
+  color: var(--accent, #4a9);
+  font-weight: 600;
+  user-select: none;
+}
+.shell-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.shell-copy-btn:hover {
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
+  color: var(--fg);
+}
+.shell-copy-btn.copied {
+  color: var(--green, #3c9);
+}
+.shell-copy-btn:focus-visible {
+  outline: 1px solid var(--accent, #4a9);
+  outline-offset: 1px;
+}
+.shell-cmd {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.shell-body {
+  display: flex;
+  flex-direction: column;
+  background: var(--terminal-bg, var(--bg-dark));
+}
+.shell-meta {
+  padding: 4px 10px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  color: var(--fg-faint);
+  border-bottom: 1px solid var(--border-soft);
+  letter-spacing: 0.01em;
+}
+.shell-footer {
+  padding: 4px 10px 6px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  border-top: 1px solid var(--border-soft);
+}
+.shell-footer.ok { color: var(--green, #3c9); }
+.shell-footer.err { color: var(--error, #e55); }
+.tool-card.shell-card .terminal-output {
+  padding: 8px 10px;
+  max-height: 280px;
+  border: none;
+  background: transparent;
+}
+.tool-card.shell-card .tool-card-body {
+  border-top: 1px solid var(--border-soft);
+  background: var(--terminal-bg, var(--bg-dark));
+}
+.tool-timeout {
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-faint);
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  flex-shrink: 0;
+}
+.tool-timeout.urgent { color: #e0a040; background: color-mix(in srgb, #e0a040 18%, transparent); }
+.tool-timeout.zero { color: #e05555; background: color-mix(in srgb, #e05555 18%, transparent); }
 .tool-card-header.edit-header .label { font-family: inherit; font-size: 12px; color: var(--fg); }
 .edit-stats { display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; flex: 0 0 auto; }
 .file-icon-img { width: 14px; height: 14px; display: block; }

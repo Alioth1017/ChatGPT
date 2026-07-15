@@ -76,11 +76,13 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   TodoRead: 5_000,
   WritePlan: 10_000,
   SwitchMode: 5_000,
+  // Foreground Task budget (bg subagents use BG_SUBAGENT_MAX_MS in loop).
+  Task: 6 * 60_000,
 };
 /** Default when a tool has no explicit entry. */
 export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
-/** Tools that manage their own lifetime (user wait / nested agent). */
-export const NO_TOOL_TIMEOUT = new Set(["Task", "AskQuestion"]);
+/** Tools that manage their own lifetime (user wait only). Task has a hard budget. */
+export const NO_TOOL_TIMEOUT = new Set(["AskQuestion"]);
 
 /** Built-in defaults in seconds (for settings UI). */
 export const DEFAULT_TOOL_TIMEOUTS_SEC: Record<string, number> = Object.fromEntries(
@@ -109,9 +111,19 @@ export function setToolTimeoutOverrides(sec: Record<string, number> | undefined)
  * into the tool when possible (Shell/Grep honor it).
  * Always settles (never hangs) even if `p` never resolves.
  */
-export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  // ms <= 0: no outer race (Task/AskQuestion manage their own lifetime).
-  // Still attach a settle handler so a late rejection cannot become unhandled.
+/**
+ * Race a tool promise against a hard timeout.
+ * On timeout: call `onTimeout` first (abort/kill), then reject immediately so
+ * the loop can settle UI without waiting for the underlying work.
+ * Late resolve/reject of `p` is ignored (no unhandled rejection).
+ */
+export function withToolTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
+  // ms <= 0: no outer race (AskQuestion manages its own lifetime).
   if (!ms || ms <= 0) {
     return Promise.resolve(p).catch((e) => {
       throw e instanceof Error ? e : new Error(String(e));
@@ -123,6 +135,7 @@ export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Pr
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      try { onTimeout?.(); } catch { /* ignore */ }
       reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
     }, limit);
     Promise.resolve(p).then(

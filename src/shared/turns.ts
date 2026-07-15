@@ -16,7 +16,7 @@ export type Mode = "agent" | "ask" | "plan" | "multitask" | "debug";
 export type AgentEvent =
   | { type: "text-delta"; text: string }
   | { type: "thinking-delta"; text: string }
-  | { type: "tool-call-started"; callId: string; name: string; input: any }
+  | { type: "tool-call-started"; callId: string; name: string; input: any; timeoutMs?: number; startedAt?: number }
   | { type: "tool-call-args"; callId: string; argsText: string }
   | {
       type: "tool-call-completed";
@@ -58,6 +58,10 @@ export interface ToolBlock {
   diff?: string;
   startLine?: number;
   endLine?: number;
+  /** Hard timeout budget (ms). UI shows countdown; 0/undefined = none. */
+  timeoutMs?: number;
+  /** Wall-clock start for countdown (ms since epoch). */
+  startedAt?: number;
   /** For task (subagent) blocks: the nested read-only sub-chat stream. */
   subBlocks?: AssistantBlock[];
   subStatus?: "running" | "finished" | "error" | "cancelled";
@@ -196,8 +200,28 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
   } else if (ev.type === "tool-call-started") {
     if (last && last.kind === "thinking" && !last.endedAt) blocks[blocks.length - 1] = { ...last, endedAt: Date.now() };
     const existing = blocks.findIndex((b) => b.kind === "tool" && b.callId === ev.callId);
-    if (existing >= 0) blocks[existing] = { ...blocks[existing], name: ev.name, input: ev.input } as AssistantBlock;
-    else blocks.push({ kind: "tool", callId: ev.callId, name: ev.name, input: ev.input, status: "running" });
+    const timeoutMs = ev.timeoutMs && ev.timeoutMs > 0 ? ev.timeoutMs : undefined;
+    const startedAt = ev.startedAt;
+    if (existing >= 0) {
+      const prev = blocks[existing] as ToolBlock;
+      blocks[existing] = {
+        ...prev,
+        name: ev.name,
+        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        timeoutMs: timeoutMs ?? prev.timeoutMs,
+        startedAt: startedAt ?? prev.startedAt,
+      } as AssistantBlock;
+    } else {
+      blocks.push({
+        kind: "tool",
+        callId: ev.callId,
+        name: ev.name,
+        input: ev.input,
+        status: "running",
+        timeoutMs,
+        startedAt,
+      });
+    }
   } else if (ev.type === "tool-call-args") {
     return blocks.map((b) =>
       b.kind === "tool" && b.callId === ev.callId ? { ...b, input: parsePartialArgs(ev.argsText, b.input) } : b
@@ -277,10 +301,29 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
     const { list, turn } = ensureAssistant(turns);
     closeThinking(turn);
     const existing = turn.blocks.findIndex((b) => b.kind === "tool" && b.callId === ev.callId);
+    const timeoutMs = ev.timeoutMs && ev.timeoutMs > 0 ? ev.timeoutMs : undefined;
+    // startedAt only when provided (execute time). Stream preview may omit it.
+    const startedAt = ev.startedAt;
     if (existing >= 0) {
-      turn.blocks[existing] = { ...turn.blocks[existing], name: ev.name, input: ev.input } as AssistantBlock;
+      const prev = turn.blocks[existing] as ToolBlock;
+      turn.blocks[existing] = {
+        ...prev,
+        name: ev.name,
+        input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
+        status: prev.status === "running" ? "running" : prev.status,
+        timeoutMs: timeoutMs ?? prev.timeoutMs,
+        startedAt: startedAt ?? prev.startedAt,
+      } as AssistantBlock;
     } else {
-      turn.blocks.push({ kind: "tool", callId: ev.callId, name: ev.name, input: ev.input, status: "running" });
+      turn.blocks.push({
+        kind: "tool",
+        callId: ev.callId,
+        name: ev.name,
+        input: ev.input,
+        status: "running",
+        timeoutMs,
+        startedAt,
+      });
     }
     return list;
   }

@@ -150,7 +150,7 @@ export type OutMessage =
   | { type: "deleteConversation"; id: string }
   | { type: "persistTurns"; convId?: string; turns: Turn[] }
   | { type: "cancelRun"; convId?: string }
-  | { type: "cancelSubagent"; callId: string }
+  | { type: "cancelSubagent"; callId: string; reason?: "timeout" | "user" }
   | { type: "answerQuestion"; callId: string; answers: Record<string, string[]> }
   | { type: "resolveApproval"; requestId: string; approve?: boolean; pattern?: string; addPattern?: "allow" | "deny"; setMode?: ApprovalMode }
   | { type: "setMode"; mode: Mode }
