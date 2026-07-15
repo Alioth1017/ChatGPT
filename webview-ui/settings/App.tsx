@@ -67,11 +67,38 @@ const NAV: { id: Section; label: string; icon: IconName; sep?: boolean }[] = [
   { id: "about", label: "About", icon: "book" },
 ];
 
+/** Built-in tool hard timeouts (seconds). Keep in sync with src/agent/tools/shared.ts. */
+const TOOL_TIMEOUT_DEFAULTS: { name: string; sec: number }[] = [
+  { name: "Shell", sec: 120 },
+  { name: "AwaitShell", sec: 150 },
+  { name: "Grep", sec: 30 },
+  { name: "Glob", sec: 30 },
+  { name: "FileSearch", sec: 20 },
+  { name: "SemanticSearch", sec: 45 },
+  { name: "SearchDocs", sec: 30 },
+  { name: "ListDir", sec: 15 },
+  { name: "Read", sec: 30 },
+  { name: "ReadLints", sec: 20 },
+  { name: "WebSearch", sec: 25 },
+  { name: "WebFetch", sec: 30 },
+  { name: "StrReplace", sec: 30 },
+  { name: "Write", sec: 30 },
+  { name: "Delete", sec: 15 },
+  { name: "EditNotebook", sec: 30 },
+  { name: "CallMcpTool", sec: 60 },
+  { name: "FetchMcpResource", sec: 45 },
+  { name: "ListMcpResources", sec: 20 },
+  { name: "TodoWrite", sec: 5 },
+  { name: "TodoRead", sec: 5 },
+  { name: "WritePlan", sec: 15 },
+  { name: "SwitchMode", sec: 5 },
+];
+
 /** Search terms per section so the nav filter finds settings inside pages too. */
 const SECTION_KEYWORDS: Partial<Record<Section, string>> = {
   general: "editor settings keyboard shortcuts notifications privacy chat titles auto judge model completion sound reset",
   usage: "tokens quota limits plan usage oauth account rate limit",
-  agents: "text size submit ctrl enter max tab count web search fetch context conversation",
+  agents: "text size submit ctrl enter max tab count web search fetch context conversation tool timeout shell grep",
   models: "enable disable model catalog reasoning effort thinking context",
   providers: "api key openai anthropic google openrouter oauth custom base url connect",
   behavior: "workspace context file reading terminal tools auto edits approval allow deny ask review policy allowlist denylist commands mcp web",
@@ -822,6 +849,31 @@ export function App() {
                 <Row title="Auto Continue" desc="Automatically continue when the step limit is reached instead of pausing.">
                   <Toggle checked={features.autoContinue === true} onChange={(v) => setFeatures({ autoContinue: v })} />
                 </Row>
+              </Group>
+
+              <div className="section-label">Tool Timeouts</div>
+              <p className="panel-hint">Hard timeout per tool (seconds). Empty = built-in default. Prevents a hung tool from blocking the agent forever.</p>
+              <Group>
+                {TOOL_TIMEOUT_DEFAULTS.map(({ name, sec }) => {
+                  const overrides = features.toolTimeoutsSec || {};
+                  const val = overrides[name];
+                  return (
+                    <Row key={name} title={name} desc={`Default ${sec}s`}>
+                      <NumInput
+                        value={val != null && val > 0 ? val : null}
+                        step="1"
+                        min="1"
+                        placeholder={String(sec)}
+                        onChange={(v) => {
+                          const next = { ...(features.toolTimeoutsSec || {}) };
+                          if (v == null || v <= 0) delete next[name];
+                          else next[name] = Math.floor(v);
+                          setFeatures({ toolTimeoutsSec: next });
+                        }}
+                      />
+                    </Row>
+                  );
+                })}
               </Group>
 
               <div className="section-label">Subagents</div>

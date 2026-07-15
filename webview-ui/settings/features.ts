@@ -260,6 +260,8 @@ export interface FeatureConfig {
   submitWithCtrlEnter: boolean;
   maxTabCount: number;
   maxAgentSteps: number;
+  /** Per-tool hard timeout overrides in seconds (empty = built-in defaults). */
+  toolTimeoutsSec: Record<string, number>;
   autoContinue: boolean;
   completionSound: boolean;
   webSearchEnabled: boolean;
@@ -346,6 +348,7 @@ export const EMPTY_FEATURES: FeatureConfig = {
   submitWithCtrlEnter: false,
   maxTabCount: 0,
   maxAgentSteps: 50,
+  toolTimeoutsSec: {},
   autoContinue: false,
   completionSound: false,
   webSearchEnabled: true,

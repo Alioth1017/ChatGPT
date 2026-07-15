@@ -28,6 +28,8 @@ export {
   disposeShellSession,
   toolTimeoutMs,
   withToolTimeout,
+  setToolTimeoutOverrides,
+  DEFAULT_TOOL_TIMEOUTS_SEC,
   type TodoItem,
 } from "./shared";
 

@@ -52,6 +52,26 @@ export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
 /** Tools that manage their own lifetime (user wait / nested agent). */
 export const NO_TOOL_TIMEOUT = new Set(["Task", "AskQuestion"]);
 
+/** Built-in defaults in seconds (for settings UI). */
+export const DEFAULT_TOOL_TIMEOUTS_SEC: Record<string, number> = Object.fromEntries(
+  Object.entries(TOOL_TIMEOUT_MS).map(([k, v]) => [k, Math.round(v / 1000)]),
+);
+
+/** User overrides from settings (tool name → seconds). Empty/missing = built-in default. */
+let toolTimeoutOverridesSec: Record<string, number> = {};
+
+/** Apply settings overrides (seconds). Call whenever feature config loads/changes. */
+export function setToolTimeoutOverrides(sec: Record<string, number> | undefined): void {
+  const next: Record<string, number> = {};
+  if (sec) {
+    for (const [k, v] of Object.entries(sec)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) next[k] = Math.floor(n);
+    }
+  }
+  toolTimeoutOverridesSec = next;
+}
+
 /**
  * Race a tool promise against a hard timeout. On timeout rejects with an Error
  * whose message starts with "timeout:" so the loop can surface it cleanly.
@@ -84,9 +104,11 @@ export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Pr
   });
 }
 
-/** Resolve the hard timeout for a tool name (0 = none). */
+/** Resolve the hard timeout for a tool name (0 = none). Honors settings overrides. */
 export function toolTimeoutMs(name: string): number {
   if (NO_TOOL_TIMEOUT.has(name)) return 0;
+  const overrideSec = toolTimeoutOverridesSec[name];
+  if (overrideSec != null && overrideSec > 0) return overrideSec * 1000;
   return TOOL_TIMEOUT_MS[name] ?? DEFAULT_TOOL_TIMEOUT_MS;
 }
 

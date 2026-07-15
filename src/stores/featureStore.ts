@@ -232,6 +232,8 @@ export interface FeatureConfig {
 	maxTabCount: number;
 	/** Max agent steps per run before pausing (0 = default 50). */
 	maxAgentSteps: number;
+	/** Per-tool hard timeout overrides in seconds (empty = built-in defaults). */
+	toolTimeoutsSec: Record<string, number>;
 	/** Automatically continue when the step limit is reached. */
 	autoContinue: boolean;
 	/** Play a sound when the agent finishes responding. */
@@ -281,6 +283,7 @@ const DEFAULTS: FeatureConfig = {
 	submitWithCtrlEnter: false,
 	maxTabCount: 0,
 	maxAgentSteps: 50,
+	toolTimeoutsSec: {},
 	autoContinue: false,
 	completionSound: false,
 	webSearchEnabled: true,
