@@ -354,6 +354,48 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
   return turns;
 }
 
+/** Mark every still-open tool / subagent / thinking block as cancelled or closed. */
+export function forceSettleOpenWork(turns: Turn[], reason: "cancelled" | "error" = "cancelled"): Turn[] {
+  const msg = reason === "error" ? "(error)" : "(cancelled)";
+  const subSt = reason === "error" ? "error" : "cancelled";
+  return turns.map((turn) => {
+    if (turn.role !== "assistant") return turn;
+    let changed = false;
+    const blocks = turn.blocks.map((b) => {
+      if (b.kind === "thinking" && !b.endedAt) {
+        changed = true;
+        return { ...b, endedAt: Date.now() };
+      }
+      if (b.kind === "tool") {
+        let next: ToolBlock = b;
+        if (b.status === "running") {
+          changed = true;
+          next = { ...next, status: "error", result: b.result || msg };
+        }
+        const isTask = b.name === "Task" || b.name === "task";
+        if (b.subStatus === "running" || (next.status === "error" && isTask && !b.subStatus)) {
+          changed = true;
+          next = { ...next, subStatus: subSt as ToolBlock["subStatus"] };
+        }
+        if (next.subBlocks?.length) {
+          const nested = forceSettleOpenWork([{ role: "assistant", blocks: next.subBlocks }], reason)[0] as AssistantTurn;
+          if (nested.blocks !== next.subBlocks) {
+            changed = true;
+            next = { ...next, subBlocks: nested.blocks };
+          }
+        }
+        return next;
+      }
+      if (b.kind === "compaction" && b.status === "running") {
+        changed = true;
+        return { ...b, status: "failed" as const };
+      }
+      return b;
+    });
+    return changed ? { role: "assistant" as const, blocks } : turn;
+  });
+}
+
 /** Close any still-open trailing thinking block (run settled). */
 export function closeTrailingThinking(turns: Turn[]): Turn[] {
   const lt = turns[turns.length - 1];

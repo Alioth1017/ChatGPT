@@ -84,10 +84,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// Per-subagent abort: child controller linked to the parent signal so the
 			// user can stop just this subagent and return to the parent.
 			const childAC = new AbortController();
-			const onParentAbort = () => childAC.abort();
-			(subSignal ?? signal).addEventListener("abort", onParentAbort);
+			const parentSig = subSignal ?? signal;
+			const onParentAbort = () => {
+				try { childAC.abort(); } catch { /* ignore */ }
+			};
+			if (parentSig.aborted) onParentAbort();
+			else parentSig.addEventListener("abort", onParentAbort, { once: true });
 			if (callId && registerSubagentAbort) {
-				registerSubagentAbort(callId, () => childAC.abort());
+				registerSubagentAbort(callId, () => {
+					try { childAC.abort(); } catch { /* ignore */ }
+				});
 			}
 			let finalText = "";
 			const runP = runAgent({
@@ -127,16 +133,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					.then(() => ({ title, text: finalText || "(subagent finished with no summary)" }))
 					.catch((e) => ({ title, text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})` }))
 					.finally(() => {
-						(subSignal ?? signal).removeEventListener("abort", onParentAbort);
+						parentSig.removeEventListener("abort", onParentAbort);
 						onHook?.("subagentStop", { subagent: title });
 					});
 				bgSubagents.push(tracked);
 				void tracked.then((v) => { bgSettled[idx] = v; });
 				return `Launched ${title} in the background${callId ? ` (call ${callId})` : ""}. It will keep working and stream its results; you do not need to wait or poll for it. When all background subagents finish, their summaries will be delivered to you automatically and you can continue.`;
 			}
-			await runP;
-			(subSignal ?? signal).removeEventListener("abort", onParentAbort);
-			onHook?.("subagentStop", { subagent: subagentName || "subagent" });
+			try {
+				await runP;
+			} catch (e) {
+				if (childAC.signal.aborted || parentSig.aborted) {
+					return "(subagent cancelled)";
+				}
+				return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
+			} finally {
+				parentSig.removeEventListener("abort", onParentAbort);
+				onHook?.("subagentStop", { subagent: subagentName || "subagent" });
+			}
+			if (childAC.signal.aborted || parentSig.aborted) return "(subagent cancelled)";
 			return finalText || "(subagent finished with no summary)";
 		};
 	}
@@ -197,6 +212,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		);
 
 	history.push({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
+	let settledEmitted = false;
+	const emitSettled = (status: "finished" | "cancelled" | "error") => {
+		if (settledEmitted) return;
+		settledEmitted = true;
+		try {
+			emit({ type: "run-status", status });
+		} catch { /* never throw from settle */ }
+	};
 	emit({ type: "run-status", status: "running" });
 
 	// Last request's usage = actual context occupancy (cumulative sums overstate
@@ -230,6 +253,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 		const bgPending = () => bgSubagents.length > bgReported;
 
+		/** Race a promise against abort + hard timeout so a stuck subagent cannot hang the chat forever. */
+		const raceAbort = <T,>(p: Promise<T>, ms = 120_000): Promise<T | "aborted" | "timeout"> =>
+			new Promise((resolve) => {
+				let done = false;
+				const finish = (v: T | "aborted" | "timeout") => {
+					if (done) return;
+					done = true;
+					resolve(v);
+				};
+				if (signal.aborted) { finish("aborted"); return; }
+				const onAbort = () => finish("aborted");
+				signal.addEventListener("abort", onAbort, { once: true });
+				const timer = setTimeout(() => finish("timeout"), ms);
+				p.then(
+					(v) => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); finish(v); },
+					() => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); finish("aborted"); },
+				);
+			});
+
 		/** Block until all unreported background subagents settle, then flush into history. */
 		const awaitPendingBg = async (): Promise<boolean> => {
 			if (!bgPending()) return false;
@@ -242,8 +284,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				type: "shell-notify",
 				message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…`,
 			});
-			await Promise.allSettled(pending);
-			if (signal.aborted) return true;
+			const outcome = await raceAbort(Promise.allSettled(pending), 10 * 60_000);
+			if (outcome === "aborted" || signal.aborted) {
+				for (let i = bgReported; i < bgSubagents.length; i++) {
+					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
+				}
+				flushSettledBg();
+				return true;
+			}
+			if (outcome === "timeout") {
+				for (let i = bgReported; i < bgSubagents.length; i++) {
+					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(timed out waiting for subagent)" };
+				}
+				flushSettledBg();
+				return true;
+			}
 			flushSettledBg();
 			return true;
 		};
@@ -285,7 +340,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				break;
 			}
 			if (signal.aborted) {
-				emit({ type: "run-status", status: "cancelled" });
+				emitSettled("cancelled");
 				return;
 			}
 
@@ -411,7 +466,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (bgPending()) {
 					await awaitPendingBg();
 					if (signal.aborted) {
-						emit({ type: "run-status", status: "cancelled" });
+						emitSettled("cancelled");
 						return;
 					}
 					continue;
@@ -612,7 +667,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (launchedBg) {
 					await awaitPendingBg();
 					if (signal.aborted) {
-						emit({ type: "run-status", status: "cancelled" });
+						emitSettled("cancelled");
 						return;
 					}
 				}
@@ -631,27 +686,39 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// conversation only contains "launched in background…" and a follow-up message
 		// makes the model believe the subagent is still running.
 		if (bgSubagents.length > bgReported) {
-			await Promise.allSettled(bgSubagents.slice(bgReported));
+			await awaitPendingBg();
 			if (signal.aborted) {
-				emit({ type: "run-status", status: "cancelled" });
+				emitSettled("cancelled");
 				return;
 			}
-			flushSettledBg();
 		}
-		emit({ type: "run-status", status: "finished" });
+		if (signal.aborted) {
+			emitSettled("cancelled");
+			return;
+		}
+		emitSettled("finished");
 		emit({ type: "run-result", text: finalText, durationMs: Date.now() - started });
 		if (!isSubagent && onAfterRun) {
 			onAfterRun();
 		}
 	} catch (e) {
 		if (signal.aborted) {
-			emit({ type: "run-status", status: "cancelled" });
+			emitSettled("cancelled");
 			return;
 		}
-		emit({ type: "error", message: e instanceof Error ? e.message : String(e) });
-		emit({ type: "run-status", status: "error" });
+		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
+		emitSettled("error");
 	} finally {
+		// Force-mark any still-unsettled bg slots so we never hang a follow-up wait.
+		if (signal.aborted || !settledEmitted) {
+			for (let i = bgReported; i < bgSubagents.length; i++) {
+				if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
+			}
+			bgReported = bgSubagents.length;
+		}
+		// Guarantee a terminal status even if the loop exited without one.
+		if (!settledEmitted) emitSettled(signal.aborted ? "cancelled" : "finished");
 		// Tear down this run's persistent shell session.
-		disposeShellSession(shellSessionKey);
+		try { disposeShellSession(shellSessionKey); } catch { /* ignore */ }
 	}
 }

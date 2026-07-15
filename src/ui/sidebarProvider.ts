@@ -26,7 +26,7 @@ import { runHooks, runBlockingHooks } from "../integrations/hooksRunner";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { allPersonas, getPersona } from "../agent/personas";
 import { pendingChanges, computeHunks } from "../stores/pendingChanges";
-import { applyEvent, closeTrailingThinking, parseMentionTokens, renderMentionTokens, type AgentEvent as SharedAgentEvent, type Turn } from "../shared/turns";
+import { applyEvent, closeTrailingThinking, forceSettleOpenWork, parseMentionTokens, renderMentionTokens, type AgentEvent as SharedAgentEvent, type Turn } from "../shared/turns";
 import { resolveFileIcon, invalidateFileIconCache } from "./fileIcons";
 import {
   searchFilesAndFolders, searchCommits, searchDocSources, searchTerminals,
@@ -224,14 +224,39 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
         case "cancelRun": {
           const id = data.convId ?? this._activeId;
-          if (id) this._sessions.get(id)?.abort.abort();
+          if (id) this._cancelSession(id);
           break;
         }
         case "cancelSubagent":
-          // callId is globally unique; find the owning session.
-          for (const s of this._sessions.values()) {
+          // callId is globally unique; find the owning session and abort that child.
+          for (const [cid, s] of this._sessions) {
             const a = s.subagentAborts.get(data.callId);
-            if (a) { a(); break; }
+            if (!a) continue;
+            try { a(); } catch { /* ignore */ }
+            // Mark this Task card cancelled immediately so the spinner stops even if
+            // the child never emits a terminal run-status.
+            s.turns = s.turns.map((turn) => {
+              if (turn.role !== "assistant") return turn;
+              let changed = false;
+              const blocks = turn.blocks.map((b) => {
+                if (b.kind !== "tool" || b.callId !== data.callId) return b;
+                changed = true;
+                return {
+                  ...b,
+                  status: b.status === "running" ? ("error" as const) : b.status,
+                  result: b.result || "(cancelled)",
+                  subStatus: "cancelled" as const,
+                };
+              });
+              return changed ? { ...turn, blocks } : turn;
+            });
+            this._persistTurnsNow(cid, s);
+            this._view?.webview.postMessage({
+              type: "agentEvent",
+              convId: cid,
+              event: { type: "subagent-event", callId: data.callId, event: { type: "run-status", status: "cancelled" } },
+            });
+            break;
           }
           break;
         case "resolveApproval":
@@ -1266,7 +1291,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const ev = event as unknown as SharedAgentEvent;
       if (ev.type === "run-status") {
         if (ev.status === "finished" || ev.status === "cancelled" || ev.status === "error") {
-          session.turns = closeTrailingThinking(session.turns);
+          session.turns = forceSettleOpenWork(
+            closeTrailingThinking(session.turns),
+            ev.status === "error" ? "error" : "cancelled",
+          );
           this._persistTurnsNow(convId, session);
         }
         // OS notification when a run completes while the window is unfocused.
@@ -1365,15 +1393,88 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       });
     } catch (err: any) {
       SidebarProvider.log.appendLine(`[${new Date().toISOString()}] [run] ${err?.stack || err?.message || err}`);
-      vscode.window.showErrorMessage(`OpenCursor: Connection failed: ${err.message}`);
-      emit({ type: "error", message: err.message } as AgentEvent);
+      try {
+        if (session.abort.signal.aborted) {
+          emit({ type: "run-status", status: "cancelled" });
+        } else {
+          vscode.window.showErrorMessage(`OpenCursor: Connection failed: ${err.message}`);
+          emit({ type: "error", message: err.message } as AgentEvent);
+          emit({ type: "run-status", status: "error" });
+        }
+      } catch { /* emit must never throw out of run */ }
     } finally {
-      if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
-      // Persist final authoritative turns + steps before dropping the session.
-      await this._store.update(convId, { turns: session.turns, steps: history });
-      this._sessions.delete(convId);
-      this._sendConversations();
+      try {
+        // Always settle open tools/subagents and clear hangable waiters.
+        for (const abort of session.subagentAborts.values()) {
+          try { abort(); } catch { /* ignore */ }
+        }
+        session.subagentAborts.clear();
+        for (const [qid, resolve] of session.pendingQuestions) {
+          session.pendingQuestions.delete(qid);
+          try { resolve({}); } catch { /* ignore */ }
+        }
+        for (const [rid, p] of session.pendingApprovals) {
+          session.pendingApprovals.delete(rid);
+          try { p.resolve(false); } catch { /* ignore */ }
+          this._view?.webview.postMessage({ type: "approvalResolved", convId, requestId: rid, approved: false });
+        }
+        // Only force-close still-open work; leave completed tools alone.
+        session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
+        if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
+        await this._store.update(convId, { turns: session.turns, steps: history });
+      } catch (e: any) {
+        SidebarProvider.log.appendLine(`[run] finally: ${e?.message || e}`);
+      } finally {
+        this._sessions.delete(convId);
+        this._sendConversations();
+        // Guarantee webview leaves "Working" even if run-status was lost (IDE reopen, stuck subagent).
+        this._view?.webview.postMessage({
+          type: "agentEvent",
+          convId,
+          event: { type: "run-status", status: session.abort.signal.aborted ? "cancelled" : "finished" },
+        });
+      }
     }
+  }
+
+  /**
+   * Hard-stop a conversation run: parent abort + every subagent, pending
+   * approvals/questions, and force-settled UI. Safe to call repeatedly.
+   */
+  private _cancelSession(convId: string): void {
+    const session = this._sessions.get(convId);
+    if (!session) {
+      // Stale UI "Working" with no live session (e.g. after IDE reopen mid-run).
+      this._view?.webview.postMessage({
+        type: "agentEvent",
+        convId,
+        event: { type: "run-status", status: "cancelled" },
+      });
+      return;
+    }
+    for (const abort of session.subagentAborts.values()) {
+      try { abort(); } catch { /* ignore */ }
+    }
+    for (const [qid, resolve] of session.pendingQuestions) {
+      session.pendingQuestions.delete(qid);
+      try { resolve({}); } catch { /* ignore */ }
+    }
+    for (const [rid, p] of session.pendingApprovals) {
+      session.pendingApprovals.delete(rid);
+      try { p.resolve(false); } catch { /* ignore */ }
+      this._view?.webview.postMessage({ type: "approvalResolved", convId, requestId: rid, approved: false });
+    }
+    session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
+    this._persistTurnsNow(convId, session);
+    try {
+      if (!session.abort.signal.aborted) session.abort.abort();
+    } catch { /* ignore */ }
+    // Immediate UI settle so Stop never feels dead while the loop unwinds.
+    this._view?.webview.postMessage({
+      type: "agentEvent",
+      convId,
+      event: { type: "run-status", status: "cancelled" },
+    });
   }
 
   private _getHtmlForWebview(webview: vscode.Webview) {

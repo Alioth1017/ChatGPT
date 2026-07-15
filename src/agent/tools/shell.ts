@@ -95,6 +95,10 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
   const onAbort = () => {
     sh.output += "\n(aborted)";
     sh.done = true;
+    try {
+      if (process.platform === "win32") session.proc.kill();
+      else session.proc.kill("SIGTERM");
+    } catch { /* ignore */ }
   };
   abortSignal?.addEventListener("abort", onAbort);
 

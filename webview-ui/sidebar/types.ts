@@ -35,7 +35,7 @@ export type {
   AssistantTurn,
   Turn,
 };
-export { applyEvent, applyToBlocks, parsePartialArgs, closeTrailingThinking, renderMentionTokens, parseMentionTokens } from "../../src/shared/turns";
+export { applyEvent, applyToBlocks, parsePartialArgs, closeTrailingThinking, forceSettleOpenWork, renderMentionTokens, parseMentionTokens } from "../../src/shared/turns";
 
 export interface ConversationSummary {
   id: string;

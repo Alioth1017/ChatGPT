@@ -15,7 +15,7 @@ import { Composer, KIND_SVG, applyFileIconTo } from "./components/Composer";
 import { ToolCard, isReadonlySubagent } from "./components/Tool";
 import { History } from "./components/History";
 import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
-import { applyEvent, applyToBlocks, parsePartialArgs, renderMentionTokens } from "./types";
+import { applyEvent, applyToBlocks, closeTrailingThinking, forceSettleOpenWork, parsePartialArgs, renderMentionTokens } from "./types";
 
 function post(msg: OutMessage) {
   vscode.postMessage(msg);
@@ -854,20 +854,29 @@ export function App() {
     for (const [id, s] of sessionsRef.current) {
       if (!id) continue;
       const live = set.has(id);
-      if (live && !s.running) { s.running = true; if (!s.status.text) s.status = { text: "Working" }; }
-      else if (!live && s.running) { s.running = false; }
+      if (live && !s.running) {
+        s.running = true;
+        if (!s.status.text) s.status = { text: "Working" };
+      } else if (!live && s.running) {
+        // Host no longer has this run (stop, crash, IDE reopen) — clear Working.
+        s.running = false;
+        s.status = { text: "" };
+        s.turns = forceSettleOpenWork(closeTrailingThinking(s.turns), "cancelled");
+      }
     }
   };
 
   // Seed a session's turns from persisted data without clobbering a live run.
   const seedSession = (id: string | undefined, persisted: Turn[], usedTokens?: number) => {
     if (!id) return;
+    // Stale "running" tools left on disk after IDE close → settle them.
+    const clean = forceSettleOpenWork(closeTrailingThinking(persisted), "cancelled");
     const s = sessionsRef.current.get(id);
     if (!s) {
-      sessionsRef.current.set(id, { turns: persisted, running: false, status: { text: "" }, usedTokens });
+      sessionsRef.current.set(id, { turns: clean, running: false, status: { text: "" }, usedTokens });
     } else if (!s.running) {
       // Only refresh from disk when not running (live turns are authoritative).
-      s.turns = persisted;
+      s.turns = clean;
       if (usedTokens !== undefined) s.usedTokens = usedTokens;
     }
   };
@@ -964,21 +973,20 @@ export function App() {
           if (ev.type === "run-status") {
             s.status = { text: ev.status === "running" ? "Planning next moves" : ev.status === "finished" ? "" : ev.status };
             if (settled) {
+              const wasRunning = s.running;
               s.running = false;
-              if (ev.status === "finished" && uiPrefsRef.current.completionSound) playCompletionSound();
-              // Close any still-open trailing thinking block so it stops animating.
-              const lt = s.turns[s.turns.length - 1];
-              if (lt && lt.role === "assistant") {
-                const lb = lt.blocks[lt.blocks.length - 1];
-                if (lb && lb.kind === "thinking" && !lb.endedAt) {
-                  lt.blocks = [...lt.blocks.slice(0, -1), { ...lb, endedAt: Date.now() }];
-                }
-              }
+              if (wasRunning && ev.status === "finished" && uiPrefsRef.current.completionSound) playCompletionSound();
+              // Close open thinking + cancel any still-spinning tools/subagents.
+              s.turns = forceSettleOpenWork(
+                closeTrailingThinking(s.turns),
+                ev.status === "error" ? "error" : "cancelled",
+              );
               post({ type: "persistTurns", convId: msg.convId, turns: s.turns });
-              // Auto-start the next queued message for this conversation (unless
-              // this settle came from a run replaced by "send now").
-              if (suppressFlushRef.current.has(msg.convId)) suppressFlushRef.current.delete(msg.convId);
-              else window.setTimeout(() => flushQueueRef.current(msg.convId), 0);
+              // Auto-start the next queued message once (duplicate settle from host finally must not double-flush).
+              if (wasRunning) {
+                if (suppressFlushRef.current.has(msg.convId)) suppressFlushRef.current.delete(msg.convId);
+                else window.setTimeout(() => flushQueueRef.current(msg.convId), 0);
+              }
             }
           } else {
             s.turns = applyEvent(s.turns, ev);
