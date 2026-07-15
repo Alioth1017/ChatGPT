@@ -4,6 +4,30 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.3] - 2026-07-15
+
+### Added
+
+- Indexing enable/disable toggle in settings (fully turns off semantic indexing)
+- Persistent semantic index across VS Code restarts (warm load from disk)
+- Incremental re-index of only changed files on sync/reopen
+- Real-time auto-index of new/modified files via workspace file watcher
+- Context size dropdown beside the model picker for models without catalog presets
+- Default context options (`32k`–`1m`) injected for uncatalogued models
+
+### Changed
+
+- Smart conversation summarization triggers at 80% of the usable context budget
+- Subagents run with isolated history (empty parent context); parent only receives the final Task result
+- Multitask/background Task waves wait for completion before the parent continues
+- Stop/cancel aborts all linked subagents and force-settles open tools, thinking, and compaction UI
+
+### Fixed
+
+- Stuck “working” subagent spinners and unresponsive stop in multitask mode
+- Orphaned shell processes when a run is aborted mid-command
+- Context ring default aligned with resolved `max_context` (fallback `128k`)
+
 ## [0.0.2] - 2026-07-05
 
 ### Added
