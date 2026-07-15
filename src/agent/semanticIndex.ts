@@ -79,10 +79,41 @@ export function setRemoteEmbedModel(cfg: RemoteEmbedConfig): void {
 
 const CHUNK_LINES = 40;
 const CHUNK_OVERLAP = 10;
+/** Source / doc extensions worth embedding. No binaries, lockfiles, or assets. */
 const EMBED_EXTS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".go", ".java",
-  ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt",
-  ".scala", ".md", ".json", ".html", ".css", ".scss", ".vue", ".svelte", ".sql",
+  ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+  ".py", ".pyi", ".rs", ".go", ".java", ".kt", ".kts", ".scala",
+  ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".cs",
+  ".rb", ".php", ".swift", ".m", ".mm",
+  ".vue", ".svelte", ".astro",
+  ".css", ".scss", ".less", ".sass",
+  ".html", ".htm", ".sql", ".graphql", ".gql",
+  ".md", ".mdx", ".rst", ".txt",
+  ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd",
+  ".toml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+  ".json", ".jsonc",
+  ".proto", ".thrift", ".r", ".lua", ".ex", ".exs", ".erl", ".hs", ".clj", ".cljs",
+  ".zig", ".nim", ".dart", ".tf", ".hcl",
+]);
+/** Path segment names to never index (modules, build, caches, VCS). */
+const SKIP_DIR_SEGMENTS = new Set([
+  "node_modules", ".git", "dist", "out", "build", ".next", ".nuxt", ".output",
+  ".turbo", ".cache", "coverage", ".venv", "venv", "__pycache__", ".tox",
+  ".mypy_cache", ".pytest_cache", ".ruff_cache", "target", "vendor", "Pods",
+  ".gradle", ".idea", ".vscode", "bower_components", "jspm_packages",
+  ".pnpm-store", ".yarn", "site-packages", ".svn", ".hg", ".hgcheck",
+  "DerivedData", "xcuserdata", ".terraform", ".serverless", ".parcel-cache",
+  ".svelte-kit", ".angular", "storybook-static", "cypress", "playwright-report",
+  "test-results", ".nyc_output", "htmlcov",
+]);
+/** Exact basenames that are never source to embed. */
+const SKIP_BASENAMES = new Set([
+  "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock",
+  "composer.lock", "Cargo.lock", "Gemfile.lock", "poetry.lock", "Pipfile.lock",
+  "go.sum", "flake.lock", "uv.lock",
+  ".DS_Store", "Thumbs.db", "desktop.ini",
+  "LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING", "CHANGELOG.md", "CHANGELOG",
+  "package-lock.json",
 ]);
 const MAX_FILE_BYTES = 512 * 1024;
 
@@ -284,8 +315,31 @@ export async function deleteIndex(root: string): Promise<void> {
   emitStatus(root);
 }
 
+/** True when a workspace-relative path is real source (not vendor/build/junk). */
 function isIndexableRel(rel: string): boolean {
-  return EMBED_EXTS.has(path.extname(rel).toLowerCase());
+  if (!rel || rel.startsWith("..")) return false;
+  const parts = rel.split("/");
+  const base = parts[parts.length - 1] || "";
+  // Hidden files at any depth except common source dots (.env.example etc. skipped too).
+  if (base.startsWith(".") && base !== ".gitignore" && base !== ".editorconfig") return false;
+  for (const seg of parts) {
+    if (!seg) continue;
+    if (SKIP_DIR_SEGMENTS.has(seg)) return false;
+    // Nested deps / generated trees often use these prefixes.
+    if (seg.startsWith(".") && (seg === ".git" || seg.endsWith("_cache") || seg.endsWith("-cache"))) return false;
+  }
+  if (SKIP_BASENAMES.has(base)) return false;
+  // Minified / bundled / source maps (not author source).
+  if (/\.(min|bundle|chunk)\.(js|css|mjs|cjs)$/i.test(base)) return false;
+  if (/\.map$/i.test(base)) return false;
+  if (/\.(png|jpe?g|gif|webp|ico|svg|woff2?|ttf|eot|mp[34]|wav|zip|gz|tgz|7z|rar|pdf|wasm|exe|dll|so|dylib|bin|o|a|class|jar|war|ear|pyc|pyo|whl|lock)$/i.test(base)) {
+    return false;
+  }
+  const ext = path.extname(base).toLowerCase();
+  if (!EMBED_EXTS.has(ext)) return false;
+  // package.json etc. OK; skip huge generated JSON dumps by name pattern.
+  if (ext === ".json" && /(^|[-_.])(lock|bundle|manifest|sourcemap)([-_.]|$)/i.test(base)) return false;
+  return true;
 }
 
 async function embedFileInto(idx: IndexFile, root: string, rel: string): Promise<boolean> {
@@ -420,8 +474,8 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
     const targets: string[] = [];
     const seen = new Set<string>();
     for (const f of all) {
-      if (!EMBED_EXTS.has(path.extname(f).toLowerCase())) continue;
       const rel = path.relative(root, f).split(path.sep).join("/");
+      if (!isIndexableRel(rel)) continue;
       let st;
       try { st = await fs.stat(f); } catch { continue; }
       if (st.size > MAX_FILE_BYTES) continue;

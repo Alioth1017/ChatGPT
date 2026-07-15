@@ -13,8 +13,38 @@ import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import type { SubagentRunner, QuestionAsker } from "./types";
 
-// Directories never walked/listed.
-export const IGNORE = new Set([".git", "node_modules", "dist", "out"]);
+// Directories never walked/listed (tools + indexing).
+export const IGNORE = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "out",
+  "build",
+  ".next",
+  ".nuxt",
+  ".output",
+  ".turbo",
+  ".cache",
+  "coverage",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".tox",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  "target",
+  "vendor",
+  "Pods",
+  ".gradle",
+  ".idea",
+  ".vscode",
+  "bower_components",
+  "jspm_packages",
+  ".pnpm-store",
+  ".yarn",
+  "site-packages",
+]);
 
 // ---------------------------------------------------------------------------
 // Per-tool hard timeouts (ms). Prevents a hung Grep/Glob/Shell/etc. from
@@ -195,7 +225,7 @@ export function firstDiffLine(before: string, after: string): number {
 
 /**
  * Recursively collect file paths under `dir` (depth-capped). IGNORE dirs
- * (.git/node_modules/dist/out) are skipped unless `includeIgnored` is true.
+ * (node_modules, .git, build caches, …) are skipped unless `includeIgnored` is true.
  */
 export async function walk(
   dir: string,

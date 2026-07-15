@@ -65,10 +65,16 @@ function onFs(uri: vscode.Uri, action: "up" | "del"): void {
   if (!root) return;
   const abs = uri.fsPath;
   if (!abs.startsWith(root) && !abs.toLowerCase().startsWith(root.toLowerCase())) return;
-  // Skip heavy/vendor trees (walk already ignores some; watcher still sees them).
+  // Skip vendor/build/non-source (upsertFile also filters; early-out saves work).
   const rel = path.relative(root, abs).split(path.sep).join("/");
   if (!rel || rel.startsWith("..")) return;
-  if (/(^|\/)(node_modules|\.git|dist|out|build|\.next|coverage)(\/|$)/.test(rel)) return;
+  if (
+    /(^|\/)(node_modules|\.git|dist|out|build|\.next|\.nuxt|\.output|\.turbo|\.cache|coverage|\.venv|venv|__pycache__|target|vendor|Pods|\.gradle|\.idea|\.vscode|bower_components|jspm_packages|\.pnpm-store|\.yarn|site-packages|\.terraform|\.svelte-kit|\.angular|storybook-static)(\/|$)/.test(
+      rel,
+    )
+  ) {
+    return;
+  }
   pending.set(abs, action);
   scheduleFlush();
 }
