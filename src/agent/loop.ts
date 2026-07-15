@@ -621,25 +621,26 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					};
 					if (signal.aborted) onParentAbort();
 					else signal.addEventListener("abort", onParentAbort, { once: true });
-					// Abort the tool slightly before the race rejects so cleanup can run.
+					// Abort slightly before the race rejects so tools can clean up.
 					let toolTimer: ReturnType<typeof setTimeout> | undefined;
 					if (limitMs > 0) {
 						toolTimer = setTimeout(() => {
 							try { toolAc.abort(); } catch { /* ignore */ }
-						}, limitMs);
+						}, Math.max(500, limitMs - 400));
 					}
 					let r: Awaited<ReturnType<typeof tool.execute>>;
 					try {
 						r = await withToolTimeout(
-							tool.execute(input, toolAc.signal, call.id, toolCtx),
+							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
 							limitMs,
 							call.name,
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
+						try { toolAc.abort(); } catch { /* ignore */ }
 						r = {
 							output: msg.startsWith("timeout:")
-								? `error: ${msg}. The tool was aborted so the agent can continue — retry with a narrower scope or shorter command.`
+								? `error: ${msg}. Tool aborted - retry with a narrower scope or shorter command.`
 								: `error: ${msg}`,
 						};
 					} finally {

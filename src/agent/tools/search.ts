@@ -39,14 +39,18 @@ const TYPE_EXTS: Record<string, string[]> = {
 
 // ---- Grep (ripgrep with a node fallback) ----
 export const grepTool = defineTool("Grep", false, async (input, abortSignal) => {
+  try {
+  if (abortSignal?.aborted) return { output: "(grep aborted)" };
   const root = getWorkspaceRoot();
   const mode: string = input.output_mode || "content";
   const target = input.path ? safePath(input.path) : ".";
-  const cap = Math.max(1, Math.min(Number(input.head_limit) || 200, 5000));
+  const cap = Math.max(1, Math.min(Number(input.head_limit) || 200, 2000));
   const skip = Math.max(0, Number(input.offset) || 0);
+  const pattern = String(input.pattern ?? "");
+  if (!pattern) return { output: "error: pattern is required" };
 
   if (await rgAvailable()) {
-    const args = ["--color=never"];
+    const args = ["--color=never", "--hidden", "--glob", "!**/.git/**", "--glob", "!**/node_modules/**"];
     if (mode === "files_with_matches") {
       args.push("--files-with-matches");
     } else if (mode === "count") {
@@ -61,26 +65,50 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
     if (input.multiline) args.push("-U", "--multiline-dotall");
     if (input.glob) args.push("--glob", String(input.glob));
     if (input.type) args.push("--type", String(input.type));
-    args.push("--", input.pattern, target);
+    args.push("--", pattern, target);
 
     const out = await new Promise<string>((res) => {
       let settled = false;
       let o = "";
-      const c = spawn("rg", args, { cwd: root, signal: abortSignal });
+      let c: ReturnType<typeof spawn>;
       const finish = (v: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        try { abortSignal?.removeEventListener("abort", onAbort); } catch { /* ignore */ }
         res(v);
+      };
+      const onAbort = () => {
+        try { c.kill("SIGTERM"); } catch { /* ignore */ }
+        finish(o ? o.slice(0, 50_000) + "\n(grep aborted)" : "(grep aborted)");
       };
       // Hard kill hung rg even if AbortSignal is missing/ignored.
       const timer = setTimeout(() => {
-        try { c.kill("SIGTERM"); } catch { /* ignore */ }
+        try { c.kill("SIGKILL"); } catch {
+          try { c.kill("SIGTERM"); } catch { /* ignore */ }
+        }
         finish(o ? o.slice(0, 50_000) + "\n(grep timed out)" : "(grep timed out)");
-      }, 25_000);
-      c.stdout?.on("data", (d) => (o += d));
+      }, 15_000);
+      try {
+        c = spawn("rg", args, { cwd: root, windowsHide: true });
+      } catch (e) {
+        finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`);
+        return;
+      }
+      if (abortSignal?.aborted) {
+        onAbort();
+        return;
+      }
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+      c.stdout?.on("data", (d) => {
+        o += d;
+        // Bound memory if rg floods output.
+        if (o.length > 2_000_000) {
+          try { c.kill("SIGTERM"); } catch { /* ignore */ }
+        }
+      });
       c.stderr?.on("data", () => { /* ignore */ });
-      c.on("error", () => finish("(grep failed)"));
+      c.on("error", (e) => finish(`(grep failed: ${e instanceof Error ? e.message : String(e)})`));
       c.on("close", () => {
         let lines = o.split("\n").filter(Boolean);
         if (skip) lines = lines.slice(skip);
@@ -93,12 +121,21 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   // Node fallback (no ripgrep available). Honor path/glob/type/-A/-B/-C/multiline.
   const scopeRoot = input.path ? safePath(input.path) : root;
   const all: string[] = [];
-  await walk(scopeRoot, all, 0, false, abortSignal);
+  await walk(scopeRoot, all, 0, false, abortSignal, 15_000);
+  if (abortSignal?.aborted) return { output: "(grep aborted)" };
 
-  const flags = input["-i"] ? "i" : "";
-  const lineRe = new RegExp(input.pattern, flags);
-  const multiRe = input.multiline ? new RegExp(input.pattern, flags + "s") : null;
-  const globRe = input.glob ? globToRe(String(input.glob).startsWith("**/") ? String(input.glob) : "**/" + String(input.glob)) : null;
+  let lineRe: RegExp;
+  let multiRe: RegExp | null = null;
+  try {
+    const flags = input["-i"] ? "i" : "";
+    lineRe = new RegExp(pattern, flags);
+    multiRe = input.multiline ? new RegExp(pattern, flags + "s") : null;
+  } catch (e) {
+    return { output: `error: invalid pattern: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  const globRe = input.glob
+    ? globToRe(String(input.glob).startsWith("**/") ? String(input.glob) : "**/" + String(input.glob))
+    : null;
   const typeExts = input.type ? TYPE_EXTS[String(input.type)] : null;
   const aCtx = Math.max(0, Number(input["-A"] ?? input["-C"] ?? 0));
   const bCtx = Math.max(0, Number(input["-B"] ?? input["-C"] ?? 0));
@@ -106,13 +143,15 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   const hitsByFile: Record<string, string[]> = {};
   const countByFile: Record<string, number> = {};
   const order: string[] = [];
-  for (const f of all.slice(0, 5000)) {
+  for (const f of all.slice(0, 3000)) {
     if (abortSignal?.aborted) return { output: "(grep aborted)" };
     const rel = path.relative(root, f).split(path.sep).join("/");
     if (globRe && !globRe.test(rel)) continue;
     if (typeExts && !typeExts.includes(path.extname(f).toLowerCase())) continue;
     let txt: string;
     try {
+      const st = await fs.stat(f);
+      if (st.size > 1_000_000) continue; // skip huge files in fallback
       txt = await fs.readFile(f, "utf8");
     } catch {
       continue; // binary / unreadable
@@ -128,17 +167,18 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
     if (multiRe) {
       if (multiRe.test(txt)) {
         countByFile[rel] = (countByFile[rel] ?? 0) + 1;
-        push(`${rel}:${txt}`);
+        push(`${rel}:${txt.slice(0, 500)}`);
       }
       continue;
     }
     const lines = txt.split("\n");
-    lines.forEach((l, idx) => {
-      if (!lineRe.test(l)) return;
+    for (let idx = 0; idx < lines.length; idx++) {
+      const l = lines[idx];
+      if (!lineRe.test(l)) continue;
       countByFile[rel] = (countByFile[rel] ?? 0) + 1;
       if (mode !== "content") {
         push(`${rel}:${idx + 1}:${l}`);
-        return;
+        continue;
       }
       for (let b = bCtx; b >= 1; b--) {
         if (idx - b >= 0) push(`${rel}-${idx + 1 - b}-${lines[idx - b]}`);
@@ -147,7 +187,7 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
       for (let a = 1; a <= aCtx; a++) {
         if (idx + a < lines.length) push(`${rel}-${idx + 1 + a}-${lines[idx + a]}`);
       }
-    });
+    }
   }
 
   let result: string[];
@@ -159,6 +199,9 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   const shown = result.slice(0, cap);
   if (!shown.length) return { output: "(no matches)" };
   return { output: shown.join("\n") + (truncated ? `\n... (at least ${result.length} matches, truncated)` : "") };
+  } catch (e) {
+    return { output: `error: Grep failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });
 
 // ---- SemanticSearch ----
@@ -179,12 +222,15 @@ function keywordFallback(input: any, abortSignal?: AbortSignal, callId?: string,
 }
 
 export const semanticSearchTool = defineTool("SemanticSearch", false, async (input, abortSignal, callId, ctx) => {
+  try {
+  if (abortSignal?.aborted) return { output: "(search aborted)" };
   const query = String(input.query || "").trim();
   if (!query) return { output: "(no query)" };
   const root = getWorkspaceRoot();
 
   // Build/refresh index on demand (incremental; cheap if already fresh).
-  if (isIndexingEnabled() && !isIndexing()) buildIndex(root).catch(() => {});
+  // Never await a full rebuild here — that hung explore tools for minutes.
+  if (isIndexingEnabled() && !isIndexing()) void buildIndex(root).catch(() => {});
 
   // Scope by target_directories (prefix match on workspace-relative paths).
   const dirs: string[] = Array.isArray(input.target_directories) ? input.target_directories : [];
@@ -207,15 +253,19 @@ export const semanticSearchTool = defineTool("SemanticSearch", false, async (inp
     .map((h) => `${h.path}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.text}`)
     .join("\n\n---\n\n");
   return { output: out };
+  } catch (e) {
+    return { output: `error: SemanticSearch failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });
 
 // ---- SearchDocs (user-indexed external documentation) ----
 export const searchDocsTool = defineTool("SearchDocs", false, async (input) => {
+  try {
   const query = String(input.query || "").trim();
   if (!query) return { output: "(no query)" };
   const k = Math.max(1, Math.min(Number(input.num_results) || 6, 12));
   const sources = listDocSources().filter((d) => (d.pages ?? 0) > 0);
-  if (!sources.length) return { output: "(no indexed doc sources — the user can add them in Settings > Indexing & Docs)" };
+  if (!sources.length) return { output: "(no indexed doc sources - add them in Settings > Indexing & Docs)" };
 
   const want = String(input.doc || "").trim().toLowerCase();
   const targets = want
@@ -235,7 +285,10 @@ export const searchDocsTool = defineTool("SearchDocs", false, async (input) => {
   if (!top.length) return { output: "(no matching excerpts)" };
   return {
     output: top
-      .map((h) => `[${h.doc}] ${h.title} — ${h.url}  (score ${h.score.toFixed(3)})\n${h.text}`)
+      .map((h) => `[${h.doc}] ${h.title} - ${h.url}  (score ${h.score.toFixed(3)})\n${h.text}`)
       .join("\n\n---\n\n"),
   };
+  } catch (e) {
+    return { output: `error: SearchDocs failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });

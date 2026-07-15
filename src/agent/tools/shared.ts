@@ -51,34 +51,34 @@ export const IGNORE = new Set([
 // blocking the agent loop forever. Task/AskQuestion are excluded (own budgets).
 // ---------------------------------------------------------------------------
 export const TOOL_TIMEOUT_MS: Record<string, number> = {
-  // Shell/AwaitShell cap their own foreground wait (90s/120s); the outer
-  // timeout is a safety net above that so it never fires before the tool's.
-  Shell: 120_000,
-  AwaitShell: 150_000,
-  Grep: 30_000,
-  Glob: 30_000,
-  FileSearch: 20_000,
-  SemanticSearch: 45_000,
-  SearchDocs: 30_000,
-  ListDir: 15_000,
-  Read: 30_000,
-  ReadLints: 20_000,
-  WebSearch: 25_000,
-  WebFetch: 30_000,
-  StrReplace: 30_000,
-  Write: 30_000,
-  Delete: 15_000,
-  EditNotebook: 30_000,
-  CallMcpTool: 60_000,
-  FetchMcpResource: 45_000,
-  ListMcpResources: 20_000,
+  // Outer safety net: slightly above each tool's own cap so the tool can
+  // clean up (kill process / mark done) before the loop aborts it.
+  Shell: 45_000,
+  AwaitShell: 60_000,
+  Grep: 20_000,
+  Glob: 20_000,
+  FileSearch: 15_000,
+  SemanticSearch: 30_000,
+  SearchDocs: 25_000,
+  ListDir: 10_000,
+  Read: 20_000,
+  ReadLints: 15_000,
+  WebSearch: 20_000,
+  WebFetch: 25_000,
+  StrReplace: 20_000,
+  Write: 20_000,
+  Delete: 10_000,
+  EditNotebook: 20_000,
+  CallMcpTool: 45_000,
+  FetchMcpResource: 30_000,
+  ListMcpResources: 15_000,
   TodoWrite: 5_000,
   TodoRead: 5_000,
-  WritePlan: 15_000,
+  WritePlan: 10_000,
   SwitchMode: 5_000,
 };
 /** Default when a tool has no explicit entry. */
-export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
 /** Tools that manage their own lifetime (user wait / nested agent). */
 export const NO_TOOL_TIMEOUT = new Set(["Task", "AskQuestion"]);
 
@@ -107,17 +107,19 @@ export function setToolTimeoutOverrides(sec: Record<string, number> | undefined)
  * whose message starts with "timeout:" so the loop can surface it cleanly.
  * Does not cancel the underlying work by itself — pass a linked AbortSignal
  * into the tool when possible (Shell/Grep honor it).
+ * Always settles (never hangs) even if `p` never resolves.
  */
 export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  if (!ms || ms <= 0) return p;
+  // Guard against a never-settling promise with no explicit limit.
+  const limit = !ms || ms <= 0 ? 120_000 : ms;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error(`timeout: ${label} exceeded ${Math.round(ms / 1000)}s`));
-    }, ms);
-    p.then(
+      reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
+    }, limit);
+    Promise.resolve(p).then(
       (v) => {
         if (settled) return;
         settled = true;
@@ -128,7 +130,7 @@ export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Pr
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        reject(e);
+        reject(e instanceof Error ? e : new Error(String(e)));
       },
     );
   });
@@ -226,6 +228,7 @@ export function firstDiffLine(before: string, after: string): number {
 /**
  * Recursively collect file paths under `dir` (depth-capped). IGNORE dirs
  * (node_modules, .git, build caches, …) are skipped unless `includeIgnored` is true.
+ * Always respects AbortSignal and maxFiles so explore tools cannot hang forever.
  */
 export async function walk(
   dir: string,
@@ -234,9 +237,9 @@ export async function walk(
   includeIgnored = false,
   signal?: AbortSignal,
   /** Soft cap so huge trees cannot hang the tool forever. */
-  maxFiles = 50_000,
+  maxFiles = 20_000,
 ): Promise<void> {
-  if (depth > 12 || out.length >= maxFiles) return;
+  if (depth > 10 || out.length >= maxFiles) return;
   if (signal?.aborted) return;
   let entries;
   try {
@@ -247,11 +250,21 @@ export async function walk(
   for (const e of entries) {
     if (signal?.aborted || out.length >= maxFiles) return;
     if (!includeIgnored && IGNORE.has(e.name)) continue;
+    // Always skip the heaviest trees even when includeIgnored (Glob edge cases).
+    if (e.name === "node_modules" || e.name === ".git") {
+      if (!includeIgnored) continue;
+      // Still skip .git internals; allow node_modules only when explicitly requested.
+      if (e.name === ".git") continue;
+    }
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      await walk(full, out, depth + 1, includeIgnored, signal, maxFiles);
-    } else {
-      out.push(full);
+    try {
+      if (e.isDirectory()) {
+        await walk(full, out, depth + 1, includeIgnored, signal, maxFiles);
+      } else if (e.isFile() || e.isSymbolicLink()) {
+        out.push(full);
+      }
+    } catch {
+      /* permission / race — skip entry */
     }
   }
 }
@@ -308,12 +321,32 @@ export function slugify(s: string): string {
   );
 }
 
-/** Whether ripgrep is available on PATH. */
+/** Whether ripgrep is available on PATH (cached; 3s probe timeout). */
+let rgCached: boolean | null = null;
 export function rgAvailable(): Promise<boolean> {
+  if (rgCached != null) return Promise.resolve(rgCached);
   return new Promise((res) => {
-    const c = spawn("rg", ["--version"]);
-    c.on("error", () => res(false));
-    c.on("close", (code) => res(code === 0));
+    let settled = false;
+    const finish = (v: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rgCached = v;
+      res(v);
+    };
+    const timer = setTimeout(() => {
+      try { c.kill(); } catch { /* ignore */ }
+      finish(false);
+    }, 3_000);
+    let c: ReturnType<typeof spawn>;
+    try {
+      c = spawn("rg", ["--version"]);
+    } catch {
+      finish(false);
+      return;
+    }
+    c.on("error", () => finish(false));
+    c.on("close", (code) => finish(code === 0));
   });
 }
 
@@ -380,19 +413,47 @@ const shellSessions = new Map<string, ShellSession>();
 
 function spawnSessionShell(cwd: string): ChildProcess {
   if (process.platform === "win32") {
-    return spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"], { cwd });
+    // -File - reads stdin as a script; NonInteractive avoids prompts that hang.
+    return spawn(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+      { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+    );
   }
-  return spawn("bash", ["-i"], { cwd });
+  // Non-interactive bash (no -i): interactive mode can hang on job control / PS1.
+  return spawn("bash", ["--noprofile", "--norc"], {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
+  });
 }
 
 /** Get (or lazily create) the persistent shell session for a run key. */
 export function getShellSession(key: string, cwd: string): ShellSession {
   let s = shellSessions.get(key);
-  if (s && !s.proc.killed && s.proc.exitCode === null) return s;
+  if (s && !s.proc.killed && s.proc.exitCode === null && s.proc.stdin && !s.proc.stdin.destroyed) {
+    return s;
+  }
+  if (s) {
+    try { s.proc.kill(); } catch { /* ignore */ }
+    shellSessions.delete(key);
+  }
   const proc = spawnSessionShell(cwd);
   s = { proc, queue: Promise.resolve(), buffer: "" };
-  proc.stdout?.on("data", (d) => (s!.buffer += d));
-  proc.stderr?.on("data", (d) => (s!.buffer += d));
+  proc.stdout?.on("data", (d) => {
+    try { s!.buffer += d.toString(); } catch { /* ignore */ }
+  });
+  proc.stderr?.on("data", (d) => {
+    try { s!.buffer += d.toString(); } catch { /* ignore */ }
+  });
+  proc.on("error", () => {
+    /* keep buffer; next getShellSession recreates */
+  });
+  proc.on("exit", () => {
+    /* session is dead; next command will respawn */
+  });
+  // Prevent unhandled 'error' on stdin from crashing the extension host.
+  proc.stdin?.on("error", () => { /* ignore broken pipe */ });
   shellSessions.set(key, s);
   return s;
 }
@@ -402,29 +463,56 @@ export function disposeShellSession(key: string): void {
   const s = shellSessions.get(key);
   if (s) {
     try {
-      s.proc.kill();
-    } catch {}
+      if (process.platform === "win32") s.proc.kill();
+      else s.proc.kill("SIGKILL");
+    } catch { /* ignore */ }
     shellSessions.delete(key);
   }
 }
 
-/** Wait until the shell finishes, `pattern` matches its output, or `ms` elapses. */
+/**
+ * Wait until the shell finishes, `pattern` matches its output, or `ms` elapses.
+ * Always resolves (never rejects). `ms <= 0` = one immediate pump + return.
+ */
 export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const deadline = Date.now() + Math.max(0, ms);
-    const tick = () => {
-      try { sh.pump?.(); } catch { /* ignore */ }
-      if (signal?.aborted) {
-        if (!sh.done) {
-          sh.output += "\n(aborted)";
-          sh.done = true;
-        }
-        return resolve();
-      }
-      if (sh.done || (pattern && pattern.test(sh.output)) || Date.now() >= deadline) return resolve();
-      setTimeout(tick, 100);
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (interval) clearInterval(interval);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
     };
-    tick();
+    const onAbort = () => {
+      if (!sh.done) {
+        sh.output += "\n(aborted)";
+        sh.done = true;
+      }
+      finish();
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    const deadline = Date.now() + Math.max(0, ms);
+    const check = () => {
+      try { sh.pump?.(); } catch { /* ignore */ }
+      if (sh.done) return finish();
+      if (pattern) {
+        try {
+          if (pattern.test(sh.output)) return finish();
+        } catch { /* bad pattern mid-wait */ }
+      }
+      if (ms <= 0 || Date.now() >= deadline) return finish();
+    };
+    // Hard wall-clock: never tick forever even if setInterval stalls.
+    const timer = setTimeout(finish, Math.max(ms, 0) + 250);
+    const interval = setInterval(check, 50);
+    check();
   });
 }
 

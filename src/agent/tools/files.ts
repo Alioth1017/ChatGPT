@@ -82,48 +82,73 @@ export const readFileTool = defineTool("Read", false, async (input) => {
 
 // ---- ListDir ----
 export const listDirTool = defineTool("ListDir", false, async (input) => {
-  const p = safePath(input.path ?? ".");
-  const entries = await fs.readdir(p, { withFileTypes: true });
-  const out =
-    entries
-      .filter((e) => !IGNORE.has(e.name))
-      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-      .join("\n") || "(empty)";
-  return { output: out };
+  try {
+    const p = safePath(input.path ?? ".");
+    const entries = await fs.readdir(p, { withFileTypes: true });
+    const out =
+      entries
+        .filter((e) => !IGNORE.has(e.name))
+        .slice(0, 2_000)
+        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+        .join("\n") || "(empty)";
+    return { output: out };
+  } catch (e) {
+    return { output: `error: ListDir failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });
 
 // ---- Glob ----
 export const globTool = defineTool("Glob", false, async (input, abortSignal) => {
-  const root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
-  // Include ignored dirs so patterns like "**/node_modules/**" can match.
-  const all: string[] = [];
-  await walk(root, all, 0, true, abortSignal);
-  // Prepend "**/" when the pattern isn't already rooted (schema behavior).
-  let pattern: string = String(input.glob_pattern ?? "");
-  if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
-  const re = globToRe(pattern);
+  try {
+    const root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
+    // Only walk ignored dirs when the pattern explicitly targets them
+    // (e.g. "**/node_modules/**") — otherwise node_modules hangs the tool.
+    let pattern: string = String(input.glob_pattern ?? "");
+    if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
+    const wantsIgnored = /node_modules|\.git|[/\\]dist[/\\]|[/\\]out[/\\]|[/\\]build[/\\]/.test(pattern);
+    const all: string[] = [];
+    await walk(root, all, 0, wantsIgnored, abortSignal, 20_000);
+    if (abortSignal?.aborted) return { output: "(glob aborted)" };
+    const re = globToRe(pattern);
 
-  // Filter, then return matches sorted by modification time (schema promise).
-  const matched = all.filter((f) => re.test(path.relative(root, f).split(path.sep).join("/")));
-  const sorted = await sortByMtime(matched);
-  const hits = sorted.slice(0, 200).map((f) => path.relative(root, f).split(path.sep).join("/"));
-  return { output: hits.join("\n") || "(no matches)" };
+    const matched = all.filter((f) => {
+      try {
+        return re.test(path.relative(root, f).split(path.sep).join("/"));
+      } catch {
+        return false;
+      }
+    });
+    // Cap mtime sort work — huge match sets made Glob look stuck.
+    const toSort = matched.slice(0, 2_000);
+    const sorted = await sortByMtime(toSort);
+    const hits = sorted.slice(0, 200).map((f) => path.relative(root, f).split(path.sep).join("/"));
+    const extra = matched.length > hits.length ? `\n… (${matched.length - hits.length} more)` : "";
+    return { output: (hits.join("\n") || "(no matches)") + extra };
+  } catch (e) {
+    return { output: `error: Glob failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });
 
 // ---- FileSearch (fuzzy filename search) ----
 export const fileSearchTool = defineTool("FileSearch", false, async (input, abortSignal) => {
-  const root = getWorkspaceRoot();
-  const all: string[] = [];
-  await walk(root, all, 0, false, abortSignal);
-  const q = String(input.query || "").toLowerCase();
-  const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
-  const scored = rel
-    .map((f) => ({ f, score: fuzzyScore(f.toLowerCase(), q) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30)
-    .map((x) => x.f);
-  return { output: scored.join("\n") || "(no matches)" };
+  try {
+    const root = getWorkspaceRoot();
+    const all: string[] = [];
+    await walk(root, all, 0, false, abortSignal, 20_000);
+    if (abortSignal?.aborted) return { output: "(FileSearch aborted)" };
+    const q = String(input.query || "").toLowerCase();
+    if (!q) return { output: "(empty query)" };
+    const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
+    const scored = rel
+      .map((f) => ({ f, score: fuzzyScore(f.toLowerCase(), q) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 30)
+      .map((x) => x.f);
+    return { output: scored.join("\n") || "(no matches)" };
+  } catch (e) {
+    return { output: `error: FileSearch failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
 });
 
 // ---- StrReplace / Write (shared edit handler) ----
