@@ -390,13 +390,27 @@ function ContextPicker({
   const values = opt.values || [];
   const openMenu = () => {
     const r = btnRef.current?.getBoundingClientRect();
-    if (r) setStyle({ position: "fixed", left: r.left, bottom: window.innerHeight - r.top + 4, zIndex: 200 });
+    if (r) {
+      setStyle({
+        position: "fixed",
+        left: Math.max(8, r.left),
+        bottom: window.innerHeight - r.top + 6,
+        zIndex: 200,
+      });
+    }
     setOpen(true);
   };
   return (
     <>
-      <button ref={btnRef} type="button" className="ctx-chip" title="Context window size" onClick={() => (open ? setOpen(false) : openMenu())}>
-        {opt.value || "ctx"}
+      <button
+        ref={btnRef}
+        type="button"
+        className="pill ctx-pill"
+        title="Context window size"
+        onClick={() => (open ? setOpen(false) : openMenu())}
+      >
+        <span>{opt.value || "ctx"}</span>
+        <Icon name="chevD" className="cd" />
       </button>
       {open && createPortal(
         <div ref={menuRef} className="mode-dropdown ctx-dropdown" style={style} onClick={(e) => e.stopPropagation()}>
@@ -411,7 +425,12 @@ function ContextPicker({
                 setOpen(false);
               }}
             >
-              {v}
+              <span className="mi-label">{v}</span>
+              {v === opt.value && (
+                <span className="mi-check">
+                  <Icon name="check" size={13} />
+                </span>
+              )}
             </button>
           ))}
         </div>,
