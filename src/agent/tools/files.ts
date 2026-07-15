@@ -117,13 +117,14 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 			return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
 		}
 
-		const sig = abortSignal ? { signal: abortSignal as AbortSignal } : {};
+		// fs.stat has no AbortSignal in @types/node — abort via withAbortTimeout only.
+		const readOpts = abortSignal ? { signal: abortSignal as AbortSignal } : undefined;
 
 		// Fast existence/type check first (before realpath) so directories error cleanly
 		// and missing/network paths fail within READ_STAT_MS.
 		let st: Awaited<ReturnType<typeof fs.stat>>;
 		try {
-			st = await withAbortTimeout(fs.stat(p, sig), READ_STAT_MS, abortSignal, "stat");
+			st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
 		} catch (e) {
 			return { output: readErrMsg(e, pathHint) };
 		}
@@ -142,7 +143,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 			if (resolved !== p) {
 				p = resolved;
 				try {
-					st = await withAbortTimeout(fs.stat(p, sig), READ_STAT_MS, abortSignal, "stat");
+					st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
 				} catch (e) {
 					return { output: readErrMsg(e, pathHint) };
 				}
@@ -170,7 +171,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 		// Image files: return a base64 image block so it reaches the model.
 		if (IMAGE_MIME[ext]) {
 			try {
-				const buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+				const buf = await withAbortTimeout(fs.readFile(p, readOpts), READ_IO_MS, abortSignal, "Read");
 				return {
 					output: `[image ${path.basename(p)} (${IMAGE_MIME[ext]}, ${buf.length} bytes)]`,
 					image: { mime: IMAGE_MIME[ext], base64: buf.toString("base64") },
@@ -184,7 +185,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 		if (ext === ".pdf") {
 			try {
 				const { PDFParse } = await import("pdf-parse");
-				const buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+				const buf = await withAbortTimeout(fs.readFile(p, readOpts), READ_IO_MS, abortSignal, "Read");
 				const parser = new PDFParse({ data: new Uint8Array(buf) });
 				const res = await withAbortTimeout(parser.getText(), READ_IO_MS, abortSignal, "PDF parse");
 				try {
@@ -207,7 +208,7 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 
 		let buf: Buffer;
 		try {
-			buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+			buf = await withAbortTimeout(fs.readFile(p, readOpts), READ_IO_MS, abortSignal, "Read");
 		} catch (e) {
 			return { output: readErrMsg(e, String(input.path)) };
 		}
