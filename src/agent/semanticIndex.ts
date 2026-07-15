@@ -8,8 +8,9 @@
  */
 
 // Real local semantic codebase index.
-// - Embeddings: @huggingface/transformers (Xenova/all-MiniLM-L6-v2, q8 ONNX/WASM)
-//   → 100% local, no server, no API key. Model downloads once to globalStorage.
+// - Embeddings: @huggingface/transformers + onnxruntime-node
+//   (Xenova/all-MiniLM-L6-v2, q8). GPU when available (DML/CUDA/CoreML/WebGPU),
+//   else CPU. 100% local; model downloads once to globalStorage.
 // - Chunking: sliding line-window per file (simple, language-agnostic).
 //   ponytail: line-window chunking; upgrade to tree-sitter AST chunks when
 //   ranking quality on large funcs matters.
@@ -59,6 +60,7 @@ export function setEmbedModel(id: string): void {
   if (m.id !== activeModel.id) {
     activeModel = m;
     extractorP = null; // force reload with new repo/dtype
+    embedDevice = null;
   }
   if (changed) {
     memIndex = null; // index built with old model is stale
@@ -136,7 +138,33 @@ export function setIndexStorageDir(dir: string): void {
 }
 
 // ---- Embedder (lazy, singleton) ----
+// ONNX Runtime Node EPs: Win→dml, Linux x64→cuda, macOS→coreml, then webgpu, then cpu.
+// transformers.js defaults to CPU only; we try GPU when available and fall back.
+function preferredEmbedDevices(): string[] {
+  const order: string[] = [];
+  switch (process.platform) {
+    case "win32":
+      order.push("dml"); // DirectML (any DX12 GPU)
+      break;
+    case "linux":
+      if (process.arch === "x64") order.push("cuda"); // needs CUDA 12 + cuDNN
+      break;
+    case "darwin":
+      order.push("coreml");
+      break;
+  }
+  order.push("webgpu", "cpu");
+  return order;
+}
+
 let extractorP: Promise<any> | null = null;
+let embedDevice: string | null = null;
+
+/** Device the live embedder is using (null until first load). */
+export function getEmbedDevice(): string | null {
+  return embedDevice;
+}
+
 async function getExtractor(): Promise<any | null> {
   if (!storageDir) return null;
   if (!extractorP) {
@@ -145,10 +173,31 @@ async function getExtractor(): Promise<any | null> {
       const t = await importRuntimeDep("@huggingface/transformers");
       t.env.allowRemoteModels = true;
       t.env.cacheDir = path.join(storageDir!, "models");
-      return t.pipeline("feature-extraction", m.repo, { dtype: m.dtype });
+      // Try GPU EPs first; ORT often fails hard if a provider's libs are missing,
+      // so probe one device at a time instead of device:"auto".
+      const devices = preferredEmbedDevices();
+      let lastErr: unknown;
+      for (const device of devices) {
+        try {
+          const pipe = await t.pipeline("feature-extraction", m.repo, {
+            dtype: m.dtype,
+            device,
+          });
+          embedDevice = device;
+          console.log(`[semanticIndex] embedder on ${device} (${m.id})`);
+          // UI may already be open; push device once the pipeline is ready.
+          if (memRoot) emitStatus(memRoot);
+          return pipe;
+        } catch (e) {
+          lastErr = e;
+          console.warn(`[semanticIndex] embedder device "${device}" unavailable, trying next…`);
+        }
+      }
+      throw lastErr ?? new Error("no embedder device available");
     })().catch((e) => {
       console.error("[semanticIndex] embedder load failed:", e);
       extractorP = null;
+      embedDevice = null;
       return null;
     });
   }
@@ -282,7 +331,24 @@ export interface IndexStatus {
   total: number;
   files: number; // indexed files in store
   chunks: number;
-  model: string; // active EmbedModel.id
+  model: string; // active EmbedModel.id or remote model id
+  /** "local" = onnxruntime-node; "remote" = provider /embeddings API. */
+  backend: "local" | "remote";
+  /** ONNX EP in use: dml | cuda | coreml | webgpu | cpu. Null until first load / remote. */
+  device: string | null;
+  /** GPU-class EP vs CPU (remote counts as neither — uses provider). */
+  accelerator: "gpu" | "cpu" | "remote" | "pending";
+  /** Human-readable device label for the UI. */
+  deviceLabel: string;
+  /** Active local model technical fields (undefined when remote). */
+  modelRepo?: string;
+  modelDtype?: string;
+  modelPooling?: string;
+  modelDim?: number;
+  /** Remote endpoint host when using a provider embedding model. */
+  remoteBaseUrl?: string;
+  runtime: string;
+  platform: string;
 }
 let progress = { done: 0, total: 0 };
 const statusSubs = new Set<(s: IndexStatus) => void>();
@@ -290,8 +356,36 @@ export function onIndexStatus(fn: (s: IndexStatus) => void): () => void {
   statusSubs.add(fn);
   return () => statusSubs.delete(fn);
 }
+
+function deviceLabelOf(device: string | null, backend: "local" | "remote"): string {
+  if (backend === "remote") return "Remote API";
+  if (!device) return "Not loaded yet";
+  switch (device) {
+    case "dml":
+      return "GPU · DirectML";
+    case "cuda":
+      return "GPU · CUDA";
+    case "coreml":
+      return "GPU · CoreML";
+    case "webgpu":
+      return "GPU · WebGPU";
+    case "cpu":
+      return "CPU";
+    default:
+      return device;
+  }
+}
+
+function acceleratorOf(device: string | null, backend: "local" | "remote"): IndexStatus["accelerator"] {
+  if (backend === "remote") return "remote";
+  if (!device) return "pending";
+  return device === "cpu" ? "cpu" : "gpu";
+}
+
 export function getStatus(root: string): IndexStatus {
   const idx = memRoot === normRoot(root) ? memIndex : null;
+  const backend: "local" | "remote" = remoteCfg ? "remote" : "local";
+  const device = backend === "remote" ? null : embedDevice;
   return {
     indexing,
     done: progress.done,
@@ -299,6 +393,17 @@ export function getStatus(root: string): IndexStatus {
     files: idx ? Object.keys(idx.files).length : 0,
     chunks: idx ? idx.chunks.length : 0,
     model: getEmbedModelId(),
+    backend,
+    device,
+    accelerator: acceleratorOf(device, backend),
+    deviceLabel: deviceLabelOf(device, backend),
+    modelRepo: backend === "local" ? activeModel.repo : undefined,
+    modelDtype: backend === "local" ? activeModel.dtype : undefined,
+    modelPooling: backend === "local" ? activeModel.pooling : undefined,
+    modelDim: backend === "local" ? activeModel.dim : undefined,
+    remoteBaseUrl: remoteCfg?.baseUrl,
+    runtime: backend === "local" ? "onnxruntime-node + @huggingface/transformers" : "OpenAI-compatible /embeddings",
+    platform: `${process.platform}-${process.arch}`,
   };
 }
 function emitStatus(root: string): void {
