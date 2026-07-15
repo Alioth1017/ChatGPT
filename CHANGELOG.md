@@ -4,6 +4,33 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.5] - 2026-07-15
+
+### Added
+
+- Live timeout countdown badges on tools/tasks; kill at zero via host abort
+- Shell tool card redesign: full command wrap, meta/body/footer, copy-command button
+- Hard budgets for foreground/background subagents so Tasks cannot hang forever
+- Stream coalescing for high-frequency agent/UI events (text/thinking/tool args)
+- Read tool wall-clock timeouts (`stat` + I/O) and abort-aware path access
+- Path normalizer for spaces, quotes, `file://` URIs, and mixed separators
+
+### Fixed
+
+- Tools stuck “Working” after timeout (immediate UI settle + cancel path)
+- Read hanging on missing/unreachable/network paths (timeout could not terminate)
+- Shell stuck on paths with spaces; PowerShell framing + session queue races
+- Invalid path throws in Read/ListDir/Glob and related tools (user-friendly errors)
+- Directory paths on Read return a clear error (suggest ListDir/Glob)
+- UI freezes from high-frequency stream postMessage / React re-renders
+- Read-only tools thrashing CPU/IO when many run in parallel (concurrency cap)
+
+### Changed
+
+- TodoWrite / TodoRead default timeout 5s → 15s
+- Read default timeout tightened to match inner I/O budget
+- Task tool included in configurable timeouts with countdown UI
+
 ## [0.0.4] - 2026-07-15
 
 ### Added
