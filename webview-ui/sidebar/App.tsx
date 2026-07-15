@@ -12,7 +12,7 @@ import { Icon } from "../shared/icons";
 import { renderMarkdown } from "../shared/markdown";
 import { vscode } from "../shared/vscode";
 import { Composer, KIND_SVG, applyFileIconTo } from "./components/Composer";
-import { ToolCard, isReadonlySubagent } from "./components/Tool";
+import { ToolCard, isReadonlySubagent, TimeoutBadge, ToolTimeoutWatch, isToolCountdownActive } from "./components/Tool";
 import { History } from "./components/History";
 import type { AgentEvent, ApprovalMode, ApprovalRequestInfo, AssistantBlock, AssistantTurn, Attachment, ConversationSummary, ErrorBlock, InMessage, MentionItem, Mode, ModelDef, ModelOption, OutMessage, PendingChangeInfo, PersonaInfo, ThinkingBlock, ToolBlock, Turn, UserTurn } from "./types";
 import { applyEvent, applyToBlocks, closeTrailingThinking, forceSettleOpenWork, parsePartialArgs, renderMentionTokens } from "./types";
@@ -213,15 +213,23 @@ function ExploringSection({
   const running = tools.some((t) => t.status === "running") || !!live;
   const current = [...tools].reverse().find((t) => t.status === "running") ?? tools[tools.length - 1];
   const subtitle = running ? capitalize(toolLabel(current.name)) : exploreSummary(tools);
+  // Keep kill-at-zero active even when the group is collapsed (no ToolCard mount).
+  const timed = tools.filter((t) => isToolCountdownActive(t) && t.timeoutMs && t.timeoutMs > 0);
+  const headTimed = timed[0] ?? (current && isToolCountdownActive(current) ? current : null);
 
   return (
     <div className={"explore-section" + (open ? " open" : "")}>
+      {/* Always watch every timed tool so countdown-0 kills even when collapsed. */}
+      {timed.map((t) => (
+        <ToolTimeoutWatch key={`watch-${t.callId}`} block={t} />
+      ))}
       <div className="explore-head" onClick={() => setOpen((o) => !o)}>
         <span className={"tchev" + (open ? " open" : "")}>
           <Icon name="chevD" size={12} />
         </span>
         <Icon name="search" size={12} className="explore-icon" />
         <span className="explore-title">{running ? "Exploring" : exploreSummary(tools)}</span>
+        {headTimed ? <TimeoutBadge block={headTimed} /> : null}
         {running ? <span className="spinner" /> : <span className="explore-count">{tools.length}</span>}
       </div>
       {!open && running && <div className="explore-subtitle">{subtitle}</div>}
@@ -425,8 +433,9 @@ function SubagentChat({ block, onBack }: { block: import("./types").ToolBlock; o
           <Icon name="chevD" size={12} /> Back to chat
         </button>
         <span className="sub-readonly">{isReadonlySubagent(block.input) ? "read-only" : "agent"}</span>
+        <TimeoutBadge block={block} />
         {running && (
-          <button className="sub-stop" onClick={() => post({ type: "cancelSubagent", callId: block.callId })}>
+          <button className="sub-stop" onClick={() => post({ type: "cancelSubagent", callId: block.callId, reason: "user" })}>
             <Icon name="close" size={12} /> Stop
           </button>
         )}

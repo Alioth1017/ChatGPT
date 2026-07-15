@@ -183,6 +183,7 @@ function TodoList({ block }: { block: ToolBlock }) {
         </span>
         <span className="label">Todos</span>
         <span className="right">
+          <TimeoutBadge block={block} />
           <StatusIcon status={block.status} />
         </span>
       </div>
@@ -291,6 +292,7 @@ function PlanCard({ block, onImplement }: { block: ToolBlock; onImplement?: (pat
           <Icon name="todo" />
         </span>
         <span className="plan-title">{title}</span>
+        <TimeoutBadge block={block} />
         <span className="badge badge-plan">Plan</span>
         <StatusIcon status={block.status} />
       </div>
@@ -324,41 +326,64 @@ function StatusIcon({ status }: { status: ToolBlock["status"] }) {
   return status === "completed" ? <Icon name="check" className="ok-icon" /> : <Icon name="close" className="err-icon" />;
 }
 
-/** Live countdown for a running tool. At 0: cancel/kill via host. */
-function useToolCountdown(block: ToolBlock): number | null {
-  const budget = block.timeoutMs && block.timeoutMs > 0 ? block.timeoutMs : 0;
-  const started = block.startedAt || 0;
+/** True while this tool/task should show a live timeout countdown. */
+export function isToolCountdownActive(block: ToolBlock): boolean {
+  if (block.name === "AskQuestion" || block.name === "ask_question") return false;
   const isTask = block.name === "Task" || block.name === "task";
-  const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
-  // Task: keep countdown while nested work is open (incl. bg after parent tool completed).
-  const running = isTask
-    ? !subDone && (block.status === "running" || block.subStatus === "running" || (!!block.subBlocks?.length && !subDone))
-    : block.status === "running";
-  const [left, setLeft] = React.useState<number | null>(() => {
-    if (!budget || !started || !running) return null;
-    return Math.max(0, Math.ceil((started + budget - Date.now()) / 1000));
-  });
-  const fired = React.useRef(false);
+  if (isTask) {
+    const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
+    if (subDone) return false;
+    // Parent tool may complete early (bg Task); keep counting while nested work open.
+    return block.status === "running" || block.subStatus === "running" || !!block.subBlocks?.length;
+  }
+  return block.status === "running";
+}
+
+/** Dedup kill-at-zero across multiple countdown mounts (explore head + card). */
+const firedTimeouts = new Set<string>();
+
+/**
+ * Live countdown for a running tool/task. At 0: cancel/kill via host.
+ * Uses host `startedAt` when present; otherwise starts the clock on first
+ * observation so every timed tool always shows a countdown.
+ */
+export function useToolCountdown(block: ToolBlock): number | null {
+  const budget = block.timeoutMs && block.timeoutMs > 0 ? block.timeoutMs : 0;
+  const hostStarted = block.startedAt && block.startedAt > 0 ? block.startedAt : 0;
+  const running = isToolCountdownActive(block);
+  const localStart = React.useRef(0);
+  const [left, setLeft] = React.useState<number | null>(null);
+
   React.useEffect(() => {
-    fired.current = false;
-    // Wait until execute has stamped startedAt (budget alone is not enough).
-    if (!budget || !started || !running) {
+    if (!running || !budget || !block.callId) {
+      localStart.current = 0;
       setLeft(null);
       return;
     }
+    // Prefer host clock; fall back to first UI observation of this run.
+    if (hostStarted) localStart.current = hostStarted;
+    else if (!localStart.current) localStart.current = Date.now();
+    // Allow re-fire only on a brand-new callId (set already cleared on settle).
+    if (block.status !== "running" && !(block.name === "Task" || block.name === "task")) {
+      firedTimeouts.delete(block.callId);
+    }
+
     const tick = () => {
-      const sec = Math.max(0, Math.ceil((started + budget - Date.now()) / 1000));
+      const start = hostStarted || localStart.current;
+      if (!start) return;
+      const sec = Math.max(0, Math.ceil((start + budget - Date.now()) / 1000));
       setLeft(sec);
-      if (sec <= 0 && !fired.current) {
-        fired.current = true;
+      if (sec <= 0 && !firedTimeouts.has(block.callId)) {
+        firedTimeouts.add(block.callId);
         post({ type: "cancelSubagent", callId: block.callId, reason: "timeout" });
       }
     };
     tick();
     const id = window.setInterval(tick, 250);
     return () => window.clearInterval(id);
-  }, [budget, started, running, block.callId, block.status, block.subStatus]);
-  if (!running || left == null) return null;
+  }, [budget, hostStarted, running, block.callId, block.status, block.subStatus, block.timeoutMs, block.name]);
+
+  if (!running || !budget || left == null) return null;
   return left;
 }
 
@@ -371,15 +396,25 @@ function formatCountdown(sec: number): string {
   return `${sec}s`;
 }
 
-function TimeoutBadge({ block }: { block: ToolBlock }) {
+/** Visible countdown badge; also drives kill-at-zero via useToolCountdown. */
+export function TimeoutBadge({ block }: { block: ToolBlock }) {
   const left = useToolCountdown(block);
   if (left == null) return null;
   const urgent = left <= 5;
   return (
-    <span className={"tool-timeout" + (urgent ? " urgent" : "") + (left === 0 ? " zero" : "")} title="Timeout remaining">
+    <span
+      className={"tool-timeout" + (urgent ? " urgent" : "") + (left === 0 ? " zero" : "")}
+      title="Timeout remaining — tool is killed at 0"
+    >
       {left === 0 ? "timeout" : formatCountdown(left)}
     </span>
   );
+}
+
+/** Silent countdown (kill at 0) without rendering — for collapsed explore groups. */
+export function ToolTimeoutWatch({ block }: { block: ToolBlock }) {
+  useToolCountdown(block);
+  return null;
 }
 
 function Diff({ diff }: { diff: string }) {

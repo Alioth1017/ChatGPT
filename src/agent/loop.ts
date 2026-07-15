@@ -652,7 +652,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// with {} would call tools with missing params — fail the call instead.
 					badArgs = true;
 				}
-				const tMs = toolTimeoutMs(call.name);
+				// MCP tools share CallMcpTool budget when no per-name override.
+				const tMs = call.name.startsWith("mcp__")
+					? toolTimeoutMs("CallMcpTool")
+					: toolTimeoutMs(call.name);
 				// Shell: countdown uses block_until_ms when shorter than tool budget.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
 				if ((call.name === "Shell" || call.name === "AwaitShell") && !badArgs) {
@@ -711,7 +714,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					finishUi(i);
 					return;
 				}
-				// MCP tool dispatch.
+				// MCP tool dispatch (same hard timeout + countdown as built-ins).
 				if (call.name.startsWith("mcp__")) {
 					if (!isAgentic()) {
 						// MCP tools may mutate; only allow in agentic modes.
@@ -732,8 +735,49 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						results[i] = { status: "error", output: `blocked by hook: ${mcpVeto}` };
 						return;
 					}
-					const out = await mcpManager.callTool(call.name, input);
-					results[i] = { status: out.startsWith("error:") ? "error" : "completed", output: out };
+					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs("CallMcpTool");
+					const toolAc = new AbortController();
+					const killTool = () => { try { toolAc.abort(); } catch { /* ignore */ } };
+					if (registerSubagentAbort) registerSubagentAbort(call.id, killTool);
+					emit({
+						type: "tool-call-started",
+						callId: call.id,
+						name: call.name,
+						input,
+						timeoutMs: limitMs > 0 ? limitMs : undefined,
+						startedAt: Date.now(),
+					});
+					const onParentAbort = () => killTool();
+					if (signal.aborted) onParentAbort();
+					else signal.addEventListener("abort", onParentAbort, { once: true });
+					try {
+						const out = await withToolTimeout(
+							Promise.resolve().then(() => mcpManager.callTool(call.name, input)),
+							limitMs,
+							call.name,
+							() => {
+								killTool();
+								results[i] = {
+									status: "error",
+									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`,
+								};
+								finishUi(i);
+							},
+						);
+						results[i] = { status: out.startsWith("error:") ? "error" : "completed", output: out };
+						finishUi(i);
+					} catch (e) {
+						const msg = e instanceof Error ? e.message : String(e);
+						results[i] = {
+							status: "error",
+							output: msg.startsWith("timeout:")
+								? `error: ${msg}. Tool aborted.`
+								: `error: ${msg}`,
+						};
+						finishUi(i);
+					} finally {
+						signal.removeEventListener("abort", onParentAbort);
+					}
 					return;
 				}
 				const tool = TOOLS[call.name];

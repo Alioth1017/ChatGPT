@@ -306,11 +306,13 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
     const startedAt = ev.startedAt;
     if (existing >= 0) {
       const prev = turn.blocks[existing] as ToolBlock;
+      // Never reopen a settled tool (timeout/cancel may race a late start).
+      if (prev.status !== "running") return list;
       turn.blocks[existing] = {
         ...prev,
         name: ev.name,
         input: Object.keys(ev.input || {}).length ? ev.input : prev.input,
-        status: prev.status === "running" ? "running" : prev.status,
+        status: "running",
         timeoutMs: timeoutMs ?? prev.timeoutMs,
         startedAt: startedAt ?? prev.startedAt,
       } as AssistantBlock;
