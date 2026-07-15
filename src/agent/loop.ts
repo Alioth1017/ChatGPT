@@ -96,6 +96,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
+			// Isolated context: empty history, own budget, no parent chat steps.
+			// Parent only receives the final summary string (run-result), never sub history.
 			const runP = runAgent({
 				apiBaseUrl,
 				apiKey,
@@ -103,12 +105,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				mode: subReadonly ? "ask" : "agent",
 				prompt: subPrompt,
 				history: [],
+				maxTokens,
+				contextTokens,
 				sampling,
+				modelParams,
 				anthropic,
 				oauthKind,
 				systemPromptOverride: subSystemOverride,
 				enableFileReading,
 				enableTerminalSuggestions,
+				enableWorkspaceContext,
 				approve,
 				isSubagent: true,
 				signal: childAC.signal,
@@ -116,8 +122,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (e.type === "run-result") {
 						finalText = e.text;
 					}
-					// Forward the subagent's stream to the parent so the UI can render it
-					// as a nested read-only sub-chat keyed by the task call id.
+					// UI-only stream; never re-inject subagent steps into parent history.
 					if (callId) {
 						emit({ type: "subagent-event", callId, event: e });
 					}

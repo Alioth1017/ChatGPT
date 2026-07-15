@@ -101,6 +101,29 @@ const effort = (value = "medium", values = ["none", "low", "medium", "high"]): M
 const thinking = (value = "adaptive", values = ["disabled", "adaptive", "enabled"]): ModelOption => ({ key: "thinking", label: "Thinking", type: "select", values, value });
 const ctx = (values: string[], value: string): ModelOption => ({ key: "max_context", label: "Context", type: "select", values, value });
 
+/** Fallback context sizes for models with no catalog preset (custom / fetched). */
+export const DEFAULT_CONTEXT_VALUES = ["32k", "64k", "128k", "200k", "256k", "512k", "1m"];
+export const DEFAULT_CONTEXT_VALUE = "128k";
+export const defaultContextOption = (): ModelOption =>
+	ctx([...DEFAULT_CONTEXT_VALUES], DEFAULT_CONTEXT_VALUE);
+
+/** Parse "200k" / "1m" / "128000" → token count. */
+export function parseContextLabel(v?: string): number {
+	if (!v) return 0;
+	const s = String(v).trim().toLowerCase();
+	const m = s.match(/^([\d.]+)\s*([kmb])?$/);
+	if (!m) {
+		const n = Number(s.replace(/[^\d.]/g, ""));
+		return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+	}
+	const n = parseFloat(m[1]);
+	const u = m[2];
+	if (u === "m") return Math.floor(n * 1_000_000);
+	if (u === "b") return Math.floor(n * 1_000_000_000);
+	if (u === "k") return Math.floor(n * 1_000);
+	return Math.floor(n);
+}
+
 /** Built-in catalog of popular coding models. Users can edit options per model. */
 export const MODEL_CATALOG: ModelDef[] = [
 	// OpenAI — gpt-5.5 is the current flagship; effort supports none/low/medium/high (xhigh on top tiers).
@@ -324,24 +347,38 @@ export class FeatureStore {
 	/** Resolved options for a model: stored overrides take precedence over defaults.
 	 *  Overrides are kind-scoped ("<kind>:<id>") so the same model id can hold
 	 *  different option state per provider (e.g. anthropic vs claude-code);
-	 *  a plain-id record is the legacy/shared fallback. */
+	 *  a plain-id record is the legacy/shared fallback.
+	 *  Models with no catalog context option get a default max_context selector. */
 	optionsFor(modelId: string, kind?: string): ModelOption[] {
 		const cfg = this.get();
 		const def = this.defFor(modelId, kind);
 		const saved = (kind ? cfg.modelOptions[`${kind}:${modelId}`] : undefined) ?? cfg.modelOptions[modelId];
-		if (!saved) return def?.options ?? [];
-		if (!def?.options) return saved;
-		// Merge: option shape (label/type/values = model capabilities) always comes
-		// from the current catalog; only the user's selected `value` is persisted.
-		// This keeps stale saved options from hiding newly-added modes/values.
-		const savedValue = new Map(saved.map((o) => [o.key, o.value]));
-		return def.options.map((o) => {
-			const v = savedValue.get(o.key);
-			if (v == null) return o;
-			// Drop a saved value that's no longer a valid choice for this option.
-			if (o.values && !o.values.includes(v)) return o;
-			return { ...o, value: v };
-		});
+		const base: ModelOption[] = (() => {
+			if (!saved) return def?.options ? [...def.options] : [];
+			if (!def?.options) return [...saved];
+			// Merge: option shape (label/type/values = model capabilities) always comes
+			// from the current catalog; only the user's selected `value` is persisted.
+			const savedValue = new Map(saved.map((o) => [o.key, o.value]));
+			return def.options.map((o) => {
+				const v = savedValue.get(o.key);
+				if (v == null) return o;
+				if (o.values && !o.values.includes(v)) return o;
+				return { ...o, value: v };
+			});
+		})();
+		// Ensure every model exposes a context window (catalog or fallback dropdown).
+		if (!base.some((o) => o.key === "max_context")) {
+			const savedCtx = saved?.find((o) => o.key === "max_context")?.value;
+			const fallback = defaultContextOption();
+			if (savedCtx && fallback.values?.includes(savedCtx)) fallback.value = savedCtx;
+			else if (savedCtx) {
+				// Keep a custom value the user typed/saved even if not in the list.
+				fallback.values = [...(fallback.values || []), savedCtx];
+				fallback.value = savedCtx;
+			}
+			base.push(fallback);
+		}
+		return base;
 	}
 
 	/** Friendly catalog label for an id, or the id itself if not catalogued. */

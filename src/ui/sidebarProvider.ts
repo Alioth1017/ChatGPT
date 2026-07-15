@@ -14,7 +14,7 @@ import { AgentEvent, Mode, Attachment } from "../agent/types";
 import { listModels, generateTitle, pickModel } from "../agent/provider";
 import { renderWebviewHtml } from "./webviewHtml";
 import { ConversationStore, titleFromText } from "../stores/conversationStore";
-import { FeatureStore, MODEL_CATALOG, kindMatches, optionsToParams, providerEnabled, type ModelDef, type ModelOption, type ProviderConfig } from "../stores/featureStore";
+import { FeatureStore, MODEL_CATALOG, kindMatches, optionsToParams, parseContextLabel, providerEnabled, type ModelDef, type ModelOption, type ProviderConfig } from "../stores/featureStore";
 import { effectiveContextLength, ensureLoaded, isRunning, serverUrlFor } from "../agent/llamacpp";
 import * as ollama from "../agent/ollama";
 import * as oauth from "../agent/oauth";
@@ -937,12 +937,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const m = f.llamacppModels.find((x) => x.id === modelId || x.id === bare);
     if (m) return effectiveContextLength(m, f.llamacppContextLength);
     const opt = this.featureStore.optionsFor(bare, oauthKind).find((o) => o.key === "max_context")?.value;
-    const parsed = /^([\d.]+)\s*([km])?$/i.exec((opt || "").trim());
-    if (parsed) {
-      const unit = (parsed[2] || "").toLowerCase();
-      return Math.round(parseFloat(parsed[1]) * (unit === "m" ? 1_000_000 : unit === "k" ? 1_000 : 1));
-    }
-    return 200_000; // ponytail: safe default; refine per-provider when model metadata is available
+    return parseContextLabel(opt) || 128_000;
   }
 
   /** Build the picker model list from ALL enabled providers. */
