@@ -73,8 +73,8 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   CallMcpTool: 45_000,
   FetchMcpResource: 30_000,
   ListMcpResources: 15_000,
-  TodoWrite: 5_000,
-  TodoRead: 5_000,
+  TodoWrite: 15_000,
+  TodoRead: 15_000,
   WritePlan: 10_000,
   SwitchMode: 5_000,
   // Foreground Task budget (bg subagents use BG_SUBAGENT_MAX_MS in loop).
