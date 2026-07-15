@@ -17,153 +17,332 @@ import { IGNORE, walk, globToRe, sortByMtime, fuzzyScore, makeDiff, firstDiffLin
 
 // Image extensions the Read tool returns as base64 blocks to the model.
 const IMAGE_MIME: Record<string, string> = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif": "image/gif",
+	".webp": "image/webp",
 };
 
+/** Race a promise against abort + wall clock so network/missing paths never hang the agent. */
+function withAbortTimeout<T>(p: Promise<T>, ms: number, signal?: AbortSignal, label = "read"): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new Error(`aborted: ${label}`));
+			return;
+		}
+		let settled = false;
+		const done = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			fn();
+		};
+		const onAbort = () => done(() => reject(new Error(`aborted: ${label}`)));
+		const timer = setTimeout(() => done(() => reject(new Error(`timeout: ${label} exceeded ${Math.round(ms / 1000)}s`))), ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		Promise.resolve(p).then(
+			(v) => done(() => resolve(v)),
+			(e) => done(() => reject(e instanceof Error ? e : new Error(String(e)))),
+		);
+	});
+}
+
+const READ_STAT_MS = 3_000;
+const READ_IO_MS = 12_000;
+const READ_MAX_BYTES = 8 * 1024 * 1024; // 8 MiB
+const BINARY_EXTS = new Set([".exe", ".dll", ".so", ".dylib", ".bin", ".dat", ".o", ".a", ".lib", ".zip", ".gz", ".7z", ".rar", ".tar", ".bz2", ".xz", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv", ".webm", ".class", ".pyc", ".pyo", ".wasm", ".node", ".pdb", ".obj"]);
+
+function readErrMsg(e: unknown, pathHint: string): string {
+	const err = e as NodeJS.ErrnoException & Error;
+	const code = err?.code;
+	const msg = err instanceof Error ? err.message : String(e);
+	if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
+		return `error: ${msg}. Path may be missing, locked, or on a slow/unreachable share: ${pathHint}`;
+	}
+	switch (code) {
+		case "ENOENT":
+			return `error: path not found: ${pathHint}`;
+		case "EACCES":
+		case "EPERM":
+			return `error: permission denied: ${pathHint}`;
+		case "EISDIR":
+			return `error: path is a directory, not a file: ${pathHint}`;
+		case "ENOTDIR":
+			return `error: parent path is not a directory: ${pathHint}`;
+		case "EBUSY":
+		case "EAGAIN":
+			return `error: file busy/locked: ${pathHint}`;
+		case "EINVAL":
+			return `error: invalid path or device: ${pathHint}`;
+		case "ENAMETOOLONG":
+			return `error: path too long: ${pathHint}`;
+		case "ELOOP":
+			return `error: too many symlinks: ${pathHint}`;
+		case "ENOTSUP":
+		case "EOPNOTSUPP":
+			return `error: operation not supported for this path: ${pathHint}`;
+		default:
+			return `error: cannot read file${code ? ` (${code})` : ""}: ${msg}`;
+	}
+}
+
+function looksBinary(buf: Buffer): boolean {
+	const n = Math.min(buf.length, 8_192);
+	let odd = 0;
+	for (let i = 0; i < n; i++) {
+		const b = buf[i];
+		if (b === 0) return true;
+		// High ratio of non-text control bytes → binary
+		if (b < 7 || (b > 13 && b < 32 && b !== 27)) odd++;
+	}
+	return n > 0 && odd / n > 0.3;
+}
+
 // ---- Read ----
-export const readFileTool = defineTool("Read", false, async (input) => {
-  if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  let p: string;
-  try {
-    p = safePath(input.path);
-  } catch (e) {
-    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  const ext = path.extname(p).toLowerCase();
+export const readFileTool = defineTool("Read", false, async (input, abortSignal) => {
+	try {
+		if (typeof input.path !== "string" || !input.path) {
+			return { output: "error: path is required and must be a string" };
+		}
+		if (abortSignal?.aborted) return { output: "error: aborted" };
 
-  // Image files: return a base64 image block so it reaches the model.
-  if (IMAGE_MIME[ext]) {
-    const buf = await fs.readFile(p);
-    return {
-      output: `[image ${path.basename(p)} (${IMAGE_MIME[ext]}, ${buf.length} bytes)]`,
-      image: { mime: IMAGE_MIME[ext], base64: buf.toString("base64") },
-    };
-  }
+		const pathHint = String(input.path);
+		let p: string;
+		try {
+			// safePath strips quotes, keeps spaces in folder names.
+			p = safePath(pathHint);
+		} catch (e) {
+			return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+		}
 
-  // PDF files: extract text (honoring the same char cap as text reads).
-  if (ext === ".pdf") {
-    try {
-      const { PDFParse } = await import("pdf-parse");
-      const buf = await fs.readFile(p);
-      const parser = new PDFParse({ data: new Uint8Array(buf) });
-      const res = await parser.getText();
-      await parser.destroy?.();
-      const text = (res?.text ?? "").slice(0, 100_000);
-      return { output: text || "(no extractable text in PDF)" };
-    } catch (e) {
-      return { output: `error: cannot read PDF: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
+		const sig = abortSignal ? { signal: abortSignal as AbortSignal } : {};
 
-  const content = await fs.readFile(p, "utf8");
-  if (content === "") return { output: "File is empty." };
+		// Fast existence/type check first (before realpath) so directories error cleanly
+		// and missing/network paths fail within READ_STAT_MS.
+		let st: Awaited<ReturnType<typeof fs.stat>>;
+		try {
+			st = await withAbortTimeout(fs.stat(p, sig), READ_STAT_MS, abortSignal, "stat");
+		} catch (e) {
+			return { output: readErrMsg(e, pathHint) };
+		}
+		if (st.isDirectory()) {
+			return {
+				output: `error: path is a directory, not a file. Use ListDir or Glob instead. Path: ${pathHint}`,
+			};
+		}
+		if (st.isFIFO?.() || st.isSocket?.() || st.isCharacterDevice?.() || st.isBlockDevice?.()) {
+			return { output: `error: path is a special device/socket/pipe, not a regular file: ${pathHint}` };
+		}
 
-  const lines = content.split("\n");
-  const totalLines = lines.length;
-  // Map Cursor's offset/limit (whole-file by default) to a line window.
-  let start = 1;
-  let end = totalLines;
-  if (input.offset !== undefined && input.offset !== null) {
-    const off = Number(input.offset);
-    start = off < 0 ? Math.max(1, totalLines + off + 1) : Math.max(1, off);
-  }
-  if (input.limit !== undefined && input.limit !== null) {
-    end = Math.min(totalLines, start + Math.max(1, Number(input.limit)) - 1);
-  } else if (input.offset !== undefined && input.offset !== null) {
-    end = totalLines;
-  }
-  if (end < start) end = start;
+		// Resolve symlinks with a short wall (broken/network links hang otherwise).
+		try {
+			const resolved = await withAbortTimeout(fs.realpath(p), READ_STAT_MS, abortSignal, "realpath");
+			if (resolved !== p) {
+				p = resolved;
+				try {
+					st = await withAbortTimeout(fs.stat(p, sig), READ_STAT_MS, abortSignal, "stat");
+				} catch (e) {
+					return { output: readErrMsg(e, pathHint) };
+				}
+				if (st.isDirectory()) {
+					return {
+						output: `error: path resolves to a directory, not a file. Use ListDir or Glob instead. Path: ${pathHint}`,
+					};
+				}
+			}
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
+				return { output: readErrMsg(e, pathHint) };
+			}
+			// keep original p; read below will surface errors
+		}
+		if (st.size > READ_MAX_BYTES) {
+			return {
+				output: `error: file too large (${st.size} bytes, max ${READ_MAX_BYTES}). Use offset/limit on a text file or pick a smaller path.`,
+			};
+		}
 
-  const out = lines
-    .slice(start - 1, end)
-    .map((l, idx) => `${start + idx}|${l}`)
-    .join("\n");
-  return { output: out, startLine: start, endLine: end };
+		const ext = path.extname(p).toLowerCase();
+
+		// Image files: return a base64 image block so it reaches the model.
+		if (IMAGE_MIME[ext]) {
+			try {
+				const buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+				return {
+					output: `[image ${path.basename(p)} (${IMAGE_MIME[ext]}, ${buf.length} bytes)]`,
+					image: { mime: IMAGE_MIME[ext], base64: buf.toString("base64") },
+				};
+			} catch (e) {
+				return { output: readErrMsg(e, String(input.path)) };
+			}
+		}
+
+		// PDF files: extract text (honoring the same char cap as text reads).
+		if (ext === ".pdf") {
+			try {
+				const { PDFParse } = await import("pdf-parse");
+				const buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+				const parser = new PDFParse({ data: new Uint8Array(buf) });
+				const res = await withAbortTimeout(parser.getText(), READ_IO_MS, abortSignal, "PDF parse");
+				try {
+					await parser.destroy?.();
+				} catch {
+					/* ignore */
+				}
+				const text = (res?.text ?? "").slice(0, 100_000);
+				return { output: text || "(no extractable text in PDF)" };
+			} catch (e) {
+				return { output: `error: cannot read PDF: ${e instanceof Error ? e.message : String(e)}` };
+			}
+		}
+
+		if (BINARY_EXTS.has(ext)) {
+			return {
+				output: `error: binary file (${ext}, ${st.size} bytes) — cannot display as text. Path: ${input.path}`,
+			};
+		}
+
+		let buf: Buffer;
+		try {
+			buf = await withAbortTimeout(fs.readFile(p, sig), READ_IO_MS, abortSignal, "Read");
+		} catch (e) {
+			return { output: readErrMsg(e, String(input.path)) };
+		}
+
+		if (buf.length === 0) return { output: "File is empty." };
+
+		if (looksBinary(buf)) {
+			return {
+				output: `error: binary content detected (${buf.length} bytes) — cannot display as text. Path: ${input.path}`,
+			};
+		}
+
+		// Decode as UTF-8 (replacement for invalid sequences so latin-1-ish files still open).
+		let content = buf.toString("utf8");
+		// Strip UTF-8 BOM if present.
+		if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
+
+		const lines = content.split(/\r?\n/);
+		const totalLines = lines.length;
+		// Map Cursor's offset/limit (whole-file by default) to a line window.
+		let start = 1;
+		let end = totalLines;
+		if (input.offset !== undefined && input.offset !== null) {
+			const off = Number(input.offset);
+			if (!Number.isFinite(off)) {
+				return { output: `error: invalid offset: ${input.offset}` };
+			}
+			start = off < 0 ? Math.max(1, totalLines + off + 1) : Math.max(1, Math.floor(off));
+		}
+		if (input.limit !== undefined && input.limit !== null) {
+			const lim = Number(input.limit);
+			if (!Number.isFinite(lim) || lim < 1) {
+				return { output: `error: invalid limit: ${input.limit}` };
+			}
+			end = Math.min(totalLines, start + Math.floor(lim) - 1);
+		} else if (input.offset !== undefined && input.offset !== null) {
+			end = totalLines;
+		}
+		if (end < start) end = start;
+		if (start > totalLines) {
+			return { output: `error: offset ${start} past end of file (${totalLines} lines)` };
+		}
+
+		const out = lines
+			.slice(start - 1, end)
+			.map((l, idx) => `${start + idx}|${l}`)
+			.join("\n");
+		return { output: out, startLine: start, endLine: end };
+	} catch (e) {
+		return { output: readErrMsg(e, String((input as { path?: string })?.path ?? "")) };
+	}
 });
 
 // ---- ListDir ----
-export const listDirTool = defineTool("ListDir", false, async (input) => {
-  try {
-    let p: string;
-    try {
-      p = safePath(input.path ?? ".");
-    } catch (e) {
-      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-    }
-    const entries = await fs.readdir(p, { withFileTypes: true });
-    const out =
-      entries
-        .filter((e) => !IGNORE.has(e.name))
-        .slice(0, 2_000)
-        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-        .join("\n") || "(empty)";
-    return { output: out };
-  } catch (e) {
-    return { output: `error: ListDir failed: ${e instanceof Error ? e.message : String(e)}` };
-  }
+export const listDirTool = defineTool("ListDir", false, async (input, abortSignal) => {
+	try {
+		if (abortSignal?.aborted) return { output: "error: aborted" };
+		let p: string;
+		try {
+			p = safePath(input.path ?? ".");
+		} catch (e) {
+			return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+		}
+		const opts: { withFileTypes: true; signal?: AbortSignal } = { withFileTypes: true };
+		if (abortSignal) opts.signal = abortSignal;
+		const entries = await withAbortTimeout(fs.readdir(p, opts), READ_IO_MS, abortSignal, "ListDir");
+		const out =
+			entries
+				.filter((e) => !IGNORE.has(e.name))
+				.slice(0, 2_000)
+				.map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+				.join("\n") || "(empty)";
+		return { output: out };
+	} catch (e) {
+		return { output: `error: ListDir failed: ${e instanceof Error ? e.message : String(e)}` };
+	}
 });
 
 // ---- Glob ----
 export const globTool = defineTool("Glob", false, async (input, abortSignal) => {
-  try {
-    let root: string;
-    try {
-      root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
-    } catch (e) {
-      return { output: `error: invalid target_directory: ${e instanceof Error ? e.message : String(e)}` };
-    }
-    // Only walk ignored dirs when the pattern explicitly targets them
-    // (e.g. "**/node_modules/**") - otherwise node_modules hangs the tool.
-    let pattern: string = String(input.glob_pattern ?? "");
-    if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
-    const wantsIgnored = /node_modules|\.git|[/\\]dist[/\\]|[/\\]out[/\\]|[/\\]build[/\\]/.test(pattern);
-    const all: string[] = [];
-    await walk(root, all, 0, wantsIgnored, abortSignal, 20_000);
-    if (abortSignal?.aborted) return { output: "(glob aborted)" };
-    const re = globToRe(pattern);
+	try {
+		let root: string;
+		try {
+			root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
+		} catch (e) {
+			return { output: `error: invalid target_directory: ${e instanceof Error ? e.message : String(e)}` };
+		}
+		// Only walk ignored dirs when the pattern explicitly targets them
+		// (e.g. "**/node_modules/**") - otherwise node_modules hangs the tool.
+		let pattern: string = String(input.glob_pattern ?? "");
+		if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
+		const wantsIgnored = /node_modules|\.git|[/\\]dist[/\\]|[/\\]out[/\\]|[/\\]build[/\\]/.test(pattern);
+		const all: string[] = [];
+		await walk(root, all, 0, wantsIgnored, abortSignal, 20_000);
+		if (abortSignal?.aborted) return { output: "(glob aborted)" };
+		const re = globToRe(pattern);
 
-    const matched = all.filter((f) => {
-      try {
-        return re.test(path.relative(root, f).split(path.sep).join("/"));
-      } catch {
-        return false;
-      }
-    });
-    // Cap mtime sort work — huge match sets made Glob look stuck.
-    const toSort = matched.slice(0, 2_000);
-    const sorted = await sortByMtime(toSort);
-    const hits = sorted.slice(0, 200).map((f) => path.relative(root, f).split(path.sep).join("/"));
-    const extra = matched.length > hits.length ? `\n… (${matched.length - hits.length} more)` : "";
-    return { output: (hits.join("\n") || "(no matches)") + extra };
-  } catch (e) {
-    return { output: `error: Glob failed: ${e instanceof Error ? e.message : String(e)}` };
-  }
+		const matched = all.filter((f) => {
+			try {
+				return re.test(path.relative(root, f).split(path.sep).join("/"));
+			} catch {
+				return false;
+			}
+		});
+		// Cap mtime sort work — huge match sets made Glob look stuck.
+		const toSort = matched.slice(0, 2_000);
+		const sorted = await sortByMtime(toSort);
+		const hits = sorted.slice(0, 200).map((f) => path.relative(root, f).split(path.sep).join("/"));
+		const extra = matched.length > hits.length ? `\n… (${matched.length - hits.length} more)` : "";
+		return { output: (hits.join("\n") || "(no matches)") + extra };
+	} catch (e) {
+		return { output: `error: Glob failed: ${e instanceof Error ? e.message : String(e)}` };
+	}
 });
 
 // ---- FileSearch (fuzzy filename search) ----
 export const fileSearchTool = defineTool("FileSearch", false, async (input, abortSignal) => {
-  try {
-    const root = getWorkspaceRoot();
-    const all: string[] = [];
-    await walk(root, all, 0, false, abortSignal, 20_000);
-    if (abortSignal?.aborted) return { output: "(FileSearch aborted)" };
-    const q = String(input.query || "").toLowerCase();
-    if (!q) return { output: "(empty query)" };
-    const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
-    const scored = rel
-      .map((f) => ({ f, score: fuzzyScore(f.toLowerCase(), q) }))
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 30)
-      .map((x) => x.f);
-    return { output: scored.join("\n") || "(no matches)" };
-  } catch (e) {
-    return { output: `error: FileSearch failed: ${e instanceof Error ? e.message : String(e)}` };
-  }
+	try {
+		const root = getWorkspaceRoot();
+		const all: string[] = [];
+		await walk(root, all, 0, false, abortSignal, 20_000);
+		if (abortSignal?.aborted) return { output: "(FileSearch aborted)" };
+		const q = String(input.query || "").toLowerCase();
+		if (!q) return { output: "(empty query)" };
+		const rel = all.map((f) => path.relative(root, f).split(path.sep).join("/"));
+		const scored = rel
+			.map((f) => ({ f, score: fuzzyScore(f.toLowerCase(), q) }))
+			.filter((x) => x.score > 0)
+			.sort((a, b) => b.score - a.score)
+			.slice(0, 30)
+			.map((x) => x.f);
+		return { output: scored.join("\n") || "(no matches)" };
+	} catch (e) {
+		return { output: `error: FileSearch failed: ${e instanceof Error ? e.message : String(e)}` };
+	}
 });
 
 // ---- StrReplace / Write (shared edit handler) ----
@@ -172,95 +351,89 @@ export const fileSearchTool = defineTool("FileSearch", false, async (input, abor
 // In multitask mode the agent is a COORDINATOR: it must NOT edit anything itself.
 // Edit tools refuse and instruct it to delegate to parallel subagents instead.
 const MULTITASK_BLOCK: ToolResult = {
-  output:
-    "error: editing is disabled in multitask mode — you are a COORDINATOR and must NOT edit files yourself. " +
-    "Delegate ALL implementation work to subagents: call the Task tool (run_in_background=true) for each " +
-    "independent unit of work and launch multiple subagents AT THE SAME TIME in a single turn. " +
-    "Have the subagents make these edits in parallel; do not call edit tools directly.",
+	output: "error: editing is disabled in multitask mode — you are a COORDINATOR and must NOT edit files yourself. " + "Delegate ALL implementation work to subagents: call the Task tool (run_in_background=true) for each " + "independent unit of work and launch multiple subagents AT THE SAME TIME in a single turn. " + "Have the subagents make these edits in parallel; do not call edit tools directly.",
 };
 
 function blockedInMultitask(ctx?: ToolContext): boolean {
-  return ctx?.getMode?.() === "multitask";
+	return ctx?.getMode?.() === "multitask";
 }
 
 const editExecute: Tool["execute"] = async (input, _signal, _callId, ctx) => {
-  if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
-  if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  let p: string;
-  try {
-    p = safePath(input.path);
-  } catch (e) {
-    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  let existedBefore = false;
-  try {
-    await fs.access(p);
-    existedBefore = true;
-  } catch {}
-  const original = existedBefore ? await fs.readFile(p, "utf8") : "";
+	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
+	if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
+	let p: string;
+	try {
+		p = safePath(input.path);
+	} catch (e) {
+		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	let existedBefore = false;
+	try {
+		await fs.access(p);
+		existedBefore = true;
+	} catch {}
+	const original = existedBefore ? await fs.readFile(p, "utf8") : "";
 
-  // Write: full create / overwrite.
-  if (input.contents !== undefined && input.old_string === undefined) {
-    await fs.mkdir(path.dirname(p), { recursive: true });
-    await fs.writeFile(p, input.contents, "utf8");
-    pendingChanges.record(input.path, original, input.contents, existedBefore);
-    return {
-      output: `wrote ${input.path} (${input.contents.split("\n").length} lines)`,
-      diff: makeDiff(input.path, original, input.contents),
-      startLine: firstDiffLine(original, input.contents),
-    };
-  }
+	// Write: full create / overwrite.
+	if (input.contents !== undefined && input.old_string === undefined) {
+		await fs.mkdir(path.dirname(p), { recursive: true });
+		await fs.writeFile(p, input.contents, "utf8");
+		pendingChanges.record(input.path, original, input.contents, existedBefore);
+		return {
+			output: `wrote ${input.path} (${input.contents.split("\n").length} lines)`,
+			diff: makeDiff(input.path, original, input.contents),
+			startLine: firstDiffLine(original, input.contents),
+		};
+	}
 
-  if (!existedBefore) {
-    return { output: `error: ${input.path} does not exist; pass contents to create it` };
-  }
+	if (!existedBefore) {
+		return { output: `error: ${input.path} does not exist; pass contents to create it` };
+	}
 
-  const oldS = input.old_string ?? "";
-  const newS = input.new_string ?? "";
-  const replaceAll = input.replace_all ?? input.allow_multiple_matches;
-  let matched = original;
+	const oldS = input.old_string ?? "";
+	const newS = input.new_string ?? "";
+	const replaceAll = input.replace_all ?? input.allow_multiple_matches;
+	let matched = original;
 
-  // Strategy 1: exact substring match.
-  const idx = original.indexOf(oldS);
-  if (idx !== -1) {
-    const isUnique = original.indexOf(oldS, idx + 1) === -1;
-    if (!isUnique && !replaceAll) {
-      return { output: `error: old_string is not unique in ${input.path}; add more context or set replace_all` };
-    }
-    matched = replaceAll
-      ? original.split(oldS).join(newS)
-      : original.slice(0, idx) + newS + original.slice(idx + oldS.length);
-  } else {
-    // Strategy 2: whitespace-insensitive line-window match.
-    const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-    const target = norm(oldS);
-    const lines = original.split("\n");
-    const windowSize = Math.max(1, oldS.split("\n").length);
-    const candidates: number[] = [];
-    for (let i = 0; i <= lines.length - windowSize; i++) {
-      if (norm(lines.slice(i, i + windowSize).join("\n")) === target) candidates.push(i);
-    }
-    if (candidates.length === 0) {
-      return { output: `error: could not find old_string in ${input.path}` };
-    }
-    if (candidates.length > 1 && !replaceAll) {
-      return { output: `error: old_string matches ${candidates.length} locations in ${input.path}; add more context` };
-    }
-    const targets = replaceAll ? candidates.slice().reverse() : [candidates[0]];
-    for (const found of targets) lines.splice(found, windowSize, ...newS.split("\n"));
-    matched = lines.join("\n");
-  }
+	// Strategy 1: exact substring match.
+	const idx = original.indexOf(oldS);
+	if (idx !== -1) {
+		const isUnique = original.indexOf(oldS, idx + 1) === -1;
+		if (!isUnique && !replaceAll) {
+			return { output: `error: old_string is not unique in ${input.path}; add more context or set replace_all` };
+		}
+		matched = replaceAll ? original.split(oldS).join(newS) : original.slice(0, idx) + newS + original.slice(idx + oldS.length);
+	} else {
+		// Strategy 2: whitespace-insensitive line-window match.
+		const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+		const target = norm(oldS);
+		const lines = original.split("\n");
+		const windowSize = Math.max(1, oldS.split("\n").length);
+		const candidates: number[] = [];
+		for (let i = 0; i <= lines.length - windowSize; i++) {
+			if (norm(lines.slice(i, i + windowSize).join("\n")) === target) candidates.push(i);
+		}
+		if (candidates.length === 0) {
+			return { output: `error: could not find old_string in ${input.path}` };
+		}
+		if (candidates.length > 1 && !replaceAll) {
+			return { output: `error: old_string matches ${candidates.length} locations in ${input.path}; add more context` };
+		}
+		const targets = replaceAll ? candidates.slice().reverse() : [candidates[0]];
+		for (const found of targets) lines.splice(found, windowSize, ...newS.split("\n"));
+		matched = lines.join("\n");
+	}
 
-  if (matched === original) {
-    return { output: `error: edit produced no change in ${input.path}` };
-  }
-  await fs.writeFile(p, matched, "utf8");
-  pendingChanges.record(input.path, original, matched, existedBefore);
-  return {
-    output: `edited ${input.path}`,
-    diff: makeDiff(input.path, original, matched),
-    startLine: firstDiffLine(original, matched),
-  };
+	if (matched === original) {
+		return { output: `error: edit produced no change in ${input.path}` };
+	}
+	await fs.writeFile(p, matched, "utf8");
+	pendingChanges.record(input.path, original, matched, existedBefore);
+	return {
+		output: `edited ${input.path}`,
+		diff: makeDiff(input.path, original, matched),
+		startLine: firstDiffLine(original, matched),
+	};
 };
 
 export const strReplaceTool = defineTool("StrReplace", true, editExecute);
@@ -268,31 +441,31 @@ export const writeTool = defineTool("Write", true, editExecute);
 
 // ---- Delete ----
 export const deleteFileTool = defineTool("Delete", true, async (input, _signal, _callId, ctx) => {
-  if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
-  if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  let p: string;
-  try {
-    p = safePath(input.path);
-  } catch (e) {
-    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  let before = "";
-  try {
-    before = await fs.readFile(p, "utf8");
-  } catch {}
-  // Schema: fail gracefully if the file doesn't exist / can't be deleted.
-  try {
-    await fs.unlink(p);
-  } catch (e: any) {
-    if (e?.code === "ENOENT") return { output: `error: ${input.path} does not exist` };
-    if (e?.code === "EISDIR" || e?.code === "EPERM" || e?.code === "EACCES") {
-      return { output: `error: cannot delete ${input.path}: ${e.code}` };
-    }
-    return { output: `error: cannot delete ${input.path}: ${e instanceof Error ? e.message : String(e)}` };
-  }
-  // Track as a change so the user can restore the deleted file.
-  pendingChanges.record(input.path, before, "", true);
-  return { output: `deleted ${input.path}` };
+	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
+	if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
+	let p: string;
+	try {
+		p = safePath(input.path);
+	} catch (e) {
+		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	let before = "";
+	try {
+		before = await fs.readFile(p, "utf8");
+	} catch {}
+	// Schema: fail gracefully if the file doesn't exist / can't be deleted.
+	try {
+		await fs.unlink(p);
+	} catch (e: any) {
+		if (e?.code === "ENOENT") return { output: `error: ${input.path} does not exist` };
+		if (e?.code === "EISDIR" || e?.code === "EPERM" || e?.code === "EACCES") {
+			return { output: `error: cannot delete ${input.path}: ${e.code}` };
+		}
+		return { output: `error: cannot delete ${input.path}: ${e instanceof Error ? e.message : String(e)}` };
+	}
+	// Track as a change so the user can restore the deleted file.
+	pendingChanges.record(input.path, before, "", true);
+	return { output: `deleted ${input.path}` };
 });
 
 // ---- EditNotebook ----
@@ -301,181 +474,179 @@ const NB_LANGS = new Set(["python", "markdown", "javascript", "typescript", "r",
 // Map a cell_language to a Jupyter cell_type. Markdown/raw map directly; every
 // programming language is a "code" cell (the language id is kept in metadata).
 function nbCellType(lang: string): "code" | "markdown" | "raw" {
-  const l = (lang || "").toLowerCase();
-  if (l === "markdown") return "markdown";
-  if (l === "raw") return "raw";
-  return "code";
+	const l = (lang || "").toLowerCase();
+	if (l === "markdown") return "markdown";
+	if (l === "raw") return "raw";
+	return "code";
 }
 // VS Code language id used in a code cell's metadata so r/sql/shell/etc keep
 // their identity (cell_type alone only distinguishes code/markdown/raw).
 function nbLanguageId(lang: string): string {
-  const l = (lang || "").toLowerCase();
-  const map: Record<string, string> = {
-    python: "python",
-    javascript: "javascript",
-    typescript: "typescript",
-    r: "r",
-    sql: "sql",
-    shell: "shellscript",
-    other: "plaintext",
-  };
-  return map[l] || "python";
+	const l = (lang || "").toLowerCase();
+	const map: Record<string, string> = {
+		python: "python",
+		javascript: "javascript",
+		typescript: "typescript",
+		r: "r",
+		sql: "sql",
+		shell: "shellscript",
+		other: "plaintext",
+	};
+	return map[l] || "python";
 }
 function nbSourceToString(source: unknown): string {
-  if (Array.isArray(source)) return source.join("");
-  return typeof source === "string" ? source : "";
+	if (Array.isArray(source)) return source.join("");
+	return typeof source === "string" ? source : "";
 }
 function nbStringToSource(s: string): string[] {
-  if (s === "") return [];
-  // Each line keeps its trailing "\n" except the final line (Jupyter convention).
-  const lines = s.split("\n");
-  return lines.map((line, i) => (i < lines.length - 1 ? line + "\n" : line));
+	if (s === "") return [];
+	// Each line keeps its trailing "\n" except the final line (Jupyter convention).
+	const lines = s.split("\n");
+	return lines.map((line, i) => (i < lines.length - 1 ? line + "\n" : line));
 }
 
 export const editNotebookTool = defineTool("EditNotebook", true, async (input, _signal, _callId, ctx) => {
-  if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
-  const target = String(input?.target_notebook ?? "");
-  if (!target) return { output: "error: target_notebook is required" };
-  if (!target.toLowerCase().endsWith(".ipynb")) {
-    return { output: "error: EditNotebook only edits .ipynb files" };
-  }
-  const cellIdx = Number(input?.cell_idx);
-  if (!Number.isInteger(cellIdx) || cellIdx < 0) {
-    return { output: "error: cell_idx must be a non-negative integer" };
-  }
-  const isNew = input?.is_new_cell === true;
-  const language = String(input?.cell_language ?? "");
-  if (language && !NB_LANGS.has(language.toLowerCase())) {
-    return { output: `error: cell_language must be one of: ${[...NB_LANGS].join(", ")}` };
-  }
-  const oldString = String(input?.old_string ?? "");
-  const newString = String(input?.new_string ?? "");
+	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
+	const target = String(input?.target_notebook ?? "");
+	if (!target) return { output: "error: target_notebook is required" };
+	if (!target.toLowerCase().endsWith(".ipynb")) {
+		return { output: "error: EditNotebook only edits .ipynb files" };
+	}
+	const cellIdx = Number(input?.cell_idx);
+	if (!Number.isInteger(cellIdx) || cellIdx < 0) {
+		return { output: "error: cell_idx must be a non-negative integer" };
+	}
+	const isNew = input?.is_new_cell === true;
+	const language = String(input?.cell_language ?? "");
+	if (language && !NB_LANGS.has(language.toLowerCase())) {
+		return { output: `error: cell_language must be one of: ${[...NB_LANGS].join(", ")}` };
+	}
+	const oldString = String(input?.old_string ?? "");
+	const newString = String(input?.new_string ?? "");
 
-  let abs: string;
-  try {
-    abs = safePath(target);
-  } catch (e) {
-    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
-  }
+	let abs: string;
+	try {
+		abs = safePath(target);
+	} catch (e) {
+		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+	}
 
-  // Read (or scaffold) the notebook JSON.
-  let nb: any;
-  let before = "";
-  try {
-    before = await fs.readFile(abs, "utf8");
-    nb = JSON.parse(before);
-  } catch (e: any) {
-    if (e?.code === "ENOENT" && isNew) {
-      nb = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 };
-    } else {
-      return { output: `error: cannot read notebook: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-  if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) {
-    return { output: "error: not a valid notebook (missing cells array)" };
-  }
+	// Read (or scaffold) the notebook JSON.
+	let nb: any;
+	let before = "";
+	try {
+		before = await fs.readFile(abs, "utf8");
+		nb = JSON.parse(before);
+	} catch (e: any) {
+		if (e?.code === "ENOENT" && isNew) {
+			nb = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 };
+		} else {
+			return { output: `error: cannot read notebook: ${e instanceof Error ? e.message : String(e)}` };
+		}
+	}
+	if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) {
+		return { output: "error: not a valid notebook (missing cells array)" };
+	}
 
-  const cellType = nbCellType(language);
-  const makeCell = (content: string) => {
-    const cell: any = { cell_type: cellType, metadata: {}, source: nbStringToSource(content) };
-    if (cellType === "code") {
-      cell.execution_count = null;
-      cell.outputs = [];
-      cell.metadata.vscode = { languageId: nbLanguageId(language) };
-    }
-    return cell;
-  };
+	const cellType = nbCellType(language);
+	const makeCell = (content: string) => {
+		const cell: any = { cell_type: cellType, metadata: {}, source: nbStringToSource(content) };
+		if (cellType === "code") {
+			cell.execution_count = null;
+			cell.outputs = [];
+			cell.metadata.vscode = { languageId: nbLanguageId(language) };
+		}
+		return cell;
+	};
 
-  if (isNew) {
-    // Insert a new cell at cell_idx (clamped to the end of the list).
-    const at = Math.min(cellIdx, nb.cells.length);
-    nb.cells.splice(at, 0, makeCell(newString));
-  } else {
-    const cell = nb.cells[cellIdx];
-    if (!cell) {
-      return { output: `error: cell ${cellIdx} does not exist (notebook has ${nb.cells.length} cells)` };
-    }
-    const src = nbSourceToString(cell.source);
-    if (oldString === "") {
-      return { output: "error: old_string is required when editing an existing cell (set is_new_cell=true to create one)" };
-    }
-    // old_string must uniquely identify the target text within the cell.
-    const first = src.indexOf(oldString);
-    if (first === -1) {
-      return { output: `error: old_string not found in cell ${cellIdx}` };
-    }
-    if (src.indexOf(oldString, first + 1) !== -1) {
-      return { output: `error: old_string is not unique in cell ${cellIdx}; add more surrounding context` };
-    }
-    const updated = src.slice(0, first) + newString + src.slice(first + oldString.length);
-    cell.source = nbStringToSource(updated);
-    // Honor an explicit language change, keeping code/markdown/raw cells valid.
-    cell.cell_type = cellType;
-    if (cellType === "code") {
-      if (cell.execution_count === undefined) cell.execution_count = null;
-      if (!Array.isArray(cell.outputs)) cell.outputs = [];
-      cell.metadata = { ...(cell.metadata ?? {}), vscode: { languageId: nbLanguageId(language) } };
-    } else {
-      // markdown / raw cells must not carry code-only keys.
-      delete cell.execution_count;
-      delete cell.outputs;
-      if (cell.metadata && cell.metadata.vscode) delete cell.metadata.vscode;
-    }
-  }
+	if (isNew) {
+		// Insert a new cell at cell_idx (clamped to the end of the list).
+		const at = Math.min(cellIdx, nb.cells.length);
+		nb.cells.splice(at, 0, makeCell(newString));
+	} else {
+		const cell = nb.cells[cellIdx];
+		if (!cell) {
+			return { output: `error: cell ${cellIdx} does not exist (notebook has ${nb.cells.length} cells)` };
+		}
+		const src = nbSourceToString(cell.source);
+		if (oldString === "") {
+			return { output: "error: old_string is required when editing an existing cell (set is_new_cell=true to create one)" };
+		}
+		// old_string must uniquely identify the target text within the cell.
+		const first = src.indexOf(oldString);
+		if (first === -1) {
+			return { output: `error: old_string not found in cell ${cellIdx}` };
+		}
+		if (src.indexOf(oldString, first + 1) !== -1) {
+			return { output: `error: old_string is not unique in cell ${cellIdx}; add more surrounding context` };
+		}
+		const updated = src.slice(0, first) + newString + src.slice(first + oldString.length);
+		cell.source = nbStringToSource(updated);
+		// Honor an explicit language change, keeping code/markdown/raw cells valid.
+		cell.cell_type = cellType;
+		if (cellType === "code") {
+			if (cell.execution_count === undefined) cell.execution_count = null;
+			if (!Array.isArray(cell.outputs)) cell.outputs = [];
+			cell.metadata = { ...(cell.metadata ?? {}), vscode: { languageId: nbLanguageId(language) } };
+		} else {
+			// markdown / raw cells must not carry code-only keys.
+			delete cell.execution_count;
+			delete cell.outputs;
+			if (cell.metadata && cell.metadata.vscode) delete cell.metadata.vscode;
+		}
+	}
 
-  const after = JSON.stringify(nb, null, 1) + "\n";
-  await fs.mkdir(path.dirname(abs), { recursive: true });
-  await fs.writeFile(abs, after, "utf8");
+	const after = JSON.stringify(nb, null, 1) + "\n";
+	await fs.mkdir(path.dirname(abs), { recursive: true });
+	await fs.writeFile(abs, after, "utf8");
 
-  const action = isNew
-    ? `Created ${cellType} cell at index ${Math.min(cellIdx, nb.cells.length - 1)}`
-    : `Edited cell ${cellIdx}`;
-  return { output: `${action} in ${target}`, diff: makeDiff(abs, before, after) };
+	const action = isNew ? `Created ${cellType} cell at index ${Math.min(cellIdx, nb.cells.length - 1)}` : `Edited cell ${cellIdx}`;
+	return { output: `${action} in ${target}`, diff: makeDiff(abs, before, after) };
 });
 
 // ---- ReadLints ----
 export const readLintsTool = defineTool("ReadLints", false, async (input) => {
-  const root = getWorkspaceRoot();
-  const all = vscode.languages.getDiagnostics();
+	const root = getWorkspaceRoot();
+	const all = vscode.languages.getDiagnostics();
 
-  // Normalize each requested path (absolute OR workspace-relative) to a
-  // workspace-relative, forward-slashed prefix. A path equal to the workspace
-  // root (or "."/"") means "all files" (empty filter list -> no filtering).
-  const toRel = (raw: string): string | null => {
-    const trimmed = String(raw).trim();
-    if (trimmed === "" || trimmed === ".") return null; // means "all"
-    const abs = path.resolve(root, trimmed);
-    let rel = path.relative(root, abs).split(path.sep).join("/");
-    if (rel === "" ) return null; // path resolves to the root itself -> all
-    rel = rel.replace(/\/+$/, "");
-    return rel.startsWith("..") ? `\u0000outside\u0000` : rel; // outside workspace -> never matches
-  };
+	// Normalize each requested path (absolute OR workspace-relative) to a
+	// workspace-relative, forward-slashed prefix. A path equal to the workspace
+	// root (or "."/"") means "all files" (empty filter list -> no filtering).
+	const toRel = (raw: string): string | null => {
+		const trimmed = String(raw).trim();
+		if (trimmed === "" || trimmed === ".") return null; // means "all"
+		const abs = path.resolve(root, trimmed);
+		let rel = path.relative(root, abs).split(path.sep).join("/");
+		if (rel === "") return null; // path resolves to the root itself -> all
+		rel = rel.replace(/\/+$/, "");
+		return rel.startsWith("..") ? `\u0000outside\u0000` : rel; // outside workspace -> never matches
+	};
 
-  let allFiles = false;
-  const filters: string[] = [];
-  if (Array.isArray(input.paths)) {
-    for (const p of input.paths) {
-      const r = toRel(p);
-      if (r === null) allFiles = true;
-      else filters.push(r);
-    }
-  }
-  // Case-insensitive comparison on win32 (drive-letter / path casing).
-  const ci = process.platform === "win32";
-  const norm = (s: string) => (ci ? s.toLowerCase() : s);
-  const filtersN = filters.map(norm);
+	let allFiles = false;
+	const filters: string[] = [];
+	if (Array.isArray(input.paths)) {
+		for (const p of input.paths) {
+			const r = toRel(p);
+			if (r === null) allFiles = true;
+			else filters.push(r);
+		}
+	}
+	// Case-insensitive comparison on win32 (drive-letter / path casing).
+	const ci = process.platform === "win32";
+	const norm = (s: string) => (ci ? s.toLowerCase() : s);
+	const filtersN = filters.map(norm);
 
-  const out: string[] = [];
-  for (const [uri, diags] of all) {
-    const relRaw = path.relative(root, uri.fsPath).split(path.sep).join("/");
-    if (relRaw.startsWith("..")) continue; // outside workspace
-    const rel = norm(relRaw);
-    if (!allFiles && filtersN.length && !filtersN.some((f) => rel === f || rel.startsWith(f + "/"))) continue;
-    for (const d of diags) {
-      if (d.severity > vscode.DiagnosticSeverity.Warning) continue;
-      const sev = d.severity === vscode.DiagnosticSeverity.Error ? "error" : "warning";
-      out.push(`${relRaw}:${d.range.start.line + 1}:${d.range.start.character + 1} ${sev}: ${d.message}`);
-    }
-  }
-  return { output: out.slice(0, 100).join("\n") || "(no diagnostics)" };
+	const out: string[] = [];
+	for (const [uri, diags] of all) {
+		const relRaw = path.relative(root, uri.fsPath).split(path.sep).join("/");
+		if (relRaw.startsWith("..")) continue; // outside workspace
+		const rel = norm(relRaw);
+		if (!allFiles && filtersN.length && !filtersN.some((f) => rel === f || rel.startsWith(f + "/"))) continue;
+		for (const d of diags) {
+			if (d.severity > vscode.DiagnosticSeverity.Warning) continue;
+			const sev = d.severity === vscode.DiagnosticSeverity.Error ? "error" : "warning";
+			out.push(`${relRaw}:${d.range.start.line + 1}:${d.range.start.character + 1} ${sev}: ${d.message}`);
+		}
+	}
+	return { output: out.slice(0, 100).join("\n") || "(no diagnostics)" };
 });

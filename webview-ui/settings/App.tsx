@@ -88,7 +88,7 @@ const TOOL_TIMEOUT_DEFAULTS: { name: string; sec: number }[] = [
   { name: "SemanticSearch", sec: 30 },
   { name: "SearchDocs", sec: 25 },
   { name: "ListDir", sec: 10 },
-  { name: "Read", sec: 20 },
+  { name: "Read", sec: 15 },
   { name: "ReadLints", sec: 15 },
   { name: "WebSearch", sec: 20 },
   { name: "WebFetch", sec: 25 },

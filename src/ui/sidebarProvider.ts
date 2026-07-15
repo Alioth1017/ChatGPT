@@ -231,45 +231,51 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           // callId is globally unique; abort tool/subagent and settle the card now.
           for (const [cid, s] of this._sessions) {
             const a = s.subagentAborts.get(data.callId);
+            // Always try abort first so hung Read/Shell stop even if card already settled.
             if (a) {
               try { a(); } catch { /* ignore */ }
               s.subagentAborts.delete(data.callId);
             }
             // Mark card settled immediately so spinner stops even if the worker
-            // never emits a terminal event (timeout / hung process).
+            // never emits a terminal event (timeout / hung process / missing path).
             let hit = false;
+            let toolName = "Tool";
+            const timedOut = data.reason === "timeout";
             s.turns = s.turns.map((turn) => {
               if (turn.role !== "assistant") return turn;
               let changed = false;
               const blocks = turn.blocks.map((b) => {
                 if (b.kind !== "tool" || b.callId !== data.callId) return b;
-                if (b.status !== "running" && b.subStatus !== "running") return b;
-                hit = true;
-                changed = true;
-                const timedOut = data.reason === "timeout";
-                const subStatus =
-                  b.name === "Task" || b.name === "task" || b.subStatus
-                    ? (timedOut ? ("error" as const) : ("cancelled" as const))
-                    : b.subStatus;
-                return {
-                  ...b,
-                  status: "error" as const,
-                  result: b.result || (timedOut ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)` : "(cancelled)"),
-                  subStatus,
-                };
+                toolName = b.name;
+                // Force settle even if already "error" but still showing running UI race.
+                if (b.status === "running" || b.subStatus === "running" || timedOut) {
+                  hit = true;
+                  changed = true;
+                  const subStatus =
+                    b.name === "Task" || b.name === "task" || b.subStatus
+                      ? (timedOut ? ("error" as const) : ("cancelled" as const))
+                      : b.subStatus;
+                  return {
+                    ...b,
+                    status: "error" as const,
+                    result:
+                      b.result ||
+                      (timedOut
+                        ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)`
+                        : "(cancelled)"),
+                    subStatus,
+                  };
+                }
+                return b;
               });
               return changed ? { ...turn, blocks } : turn;
             });
             if (!hit && !a) continue;
             this._persistTurnsNow(cid, s);
-            // Find tool name for a proper completed event.
-            let toolName = "Tool";
-            for (const turn of s.turns) {
-              if (turn.role !== "assistant") continue;
-              const b = turn.blocks.find((x) => x.kind === "tool" && x.callId === data.callId);
-              if (b && b.kind === "tool") { toolName = b.name; break; }
-            }
-            const resultMsg = data.reason === "timeout" ? "(timeout)" : "(cancelled)";
+            const resultMsg = timedOut
+              ? `(timeout after tool budget)`
+              : "(cancelled)";
+            // Always push completed so webview spinner dies even if turns map missed.
             this._view?.webview.postMessage({
               type: "agentEvent",
               convId: cid,
@@ -288,7 +294,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 event: {
                   type: "subagent-event",
                   callId: data.callId,
-                  event: { type: "run-status", status: data.reason === "timeout" ? "error" : "cancelled" },
+                  event: { type: "run-status", status: timedOut ? "error" : "cancelled" },
                 },
               });
             }
@@ -571,7 +577,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const base = folders && folders.length > 0 ? folders[0].uri : undefined;
       const isAbsolute = /^([a-zA-Z]:[\\/]|\/)/.test(relPath);
       const uri = isAbsolute ? vscode.Uri.file(relPath) : base ? vscode.Uri.joinPath(base, relPath) : vscode.Uri.file(relPath);
-      const doc = await vscode.workspace.openTextDocument(uri);
+      // Race open so a missing/network path cannot hang the extension host forever.
+      const doc = await Promise.race([
+        vscode.workspace.openTextDocument(uri),
+        new Promise<never>((_, rej) =>
+          setTimeout(() => rej(new Error("timed out opening file (path missing or unreachable)")), 5_000),
+        ),
+      ]);
       const editor = await vscode.window.showTextDocument(doc, { preview: true });
       if (startLine) {
         const s = Math.max(0, startLine - 1);
@@ -582,7 +594,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
       }
     } catch (err: any) {
-      vscode.window.showErrorMessage(`OpenCursor: Could not open ${relPath}: ${err.message}`);
+      vscode.window.showErrorMessage(`OpenCursor: Could not open ${relPath}: ${err?.message || err}`);
     }
   }
 

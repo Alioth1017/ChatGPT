@@ -61,7 +61,8 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   SemanticSearch: 30_000,
   SearchDocs: 25_000,
   ListDir: 10_000,
-  Read: 20_000,
+  // Inner Read has 3s stat + 12s I/O; outer net must be slightly above.
+  Read: 15_000,
   ReadLints: 15_000,
   WebSearch: 20_000,
   WebFetch: 25_000,
