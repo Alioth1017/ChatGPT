@@ -170,24 +170,72 @@ async function* streamWithRetry(
   }
 }
 
-/**
- * OpenAI's `tool` role content is string-only, so a tool result that carries an
- * image is split: the tool message keeps the text, and the image is forwarded
- * in a trailing `user` message right after it.
- */
-function normalizeOpenAIMessages(messages: WireMessage[]): WireMessage[] {
-  const out: WireMessage[] = [];
-  for (const m of messages) {
-    if (m.role === "tool" && Array.isArray(m.content)) {
-      const texts = m.content.filter((p): p is Extract<WireContentPart, { type: "text" }> => p.type === "text");
-      const images = m.content.filter((p): p is Extract<WireContentPart, { type: "image_url" }> => p.type === "image_url");
-      out.push({ role: "tool", tool_call_id: m.tool_call_id, content: texts.map((t) => t.text).join("\n") || "(image)" });
-      if (images.length) {
-        out.push({ role: "user", content: images as WireContentPart[] });
-      }
+/** Drop Anthropic-only `cache_control` and empty text parts (xAI/Grok 400: Empty content block). */
+function stripOpenAIParts(parts: WireContentPart[]): WireContentPart[] {
+  const out: WireContentPart[] = [];
+  for (const p of parts) {
+    if (p.type === "text") {
+      if (!p.text) continue;
+      out.push({ type: "text", text: p.text });
     } else {
-      out.push(m);
+      out.push({ type: "image_url", image_url: p.image_url });
     }
+  }
+  return out;
+}
+
+function openAIContent(content: string | WireContentPart[] | null | undefined): string | WireContentPart[] {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  const parts = stripOpenAIParts(content);
+  if (!parts.length) return "";
+  if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
+  return parts;
+}
+
+/**
+ * OpenAI chat shape: string tool content, no Anthropic cache_control, no null/empty
+ * content blocks. xAI/Grok rejects those with `Empty content block`.
+ * Tool images → tool text + trailing user image message.
+ * Returns plain objects (not only WireMessage) so tool-only assistant can omit `content`.
+ */
+function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const m of messages) {
+    if (m.role === "tool") {
+      if (Array.isArray(m.content)) {
+        const texts = m.content.filter((p): p is Extract<WireContentPart, { type: "text" }> => p.type === "text");
+        const images = m.content.filter((p): p is Extract<WireContentPart, { type: "image_url" }> => p.type === "image_url");
+        out.push({
+          role: "tool",
+          tool_call_id: m.tool_call_id,
+          content: texts.map((t) => t.text).join("\n") || (images.length ? "(image)" : "(empty)"),
+        });
+        if (images.length) {
+          out.push({ role: "user", content: stripOpenAIParts(images) });
+        }
+      } else {
+        out.push({ role: "tool", tool_call_id: m.tool_call_id, content: m.content || "(empty)" });
+      }
+      continue;
+    }
+    if (m.role === "assistant") {
+      const text = (typeof m.content === "string" ? m.content : "") || "";
+      const msg: Record<string, unknown> = { role: "assistant" };
+      // Never send null/empty content — Grok 400 "Empty content block".
+      if (text) msg.content = text;
+      else if (!m.tool_calls?.length) msg.content = "(empty)";
+      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls;
+      out.push(msg);
+      continue;
+    }
+    const content = openAIContent(m.content);
+    if (content === "" || (Array.isArray(content) && content.length === 0)) {
+      if (m.role === "system") continue;
+      out.push({ role: "user", content: "(empty)" });
+      continue;
+    }
+    out.push({ role: m.role, content });
   }
   return out;
 }
