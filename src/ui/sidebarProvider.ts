@@ -247,13 +247,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 hit = true;
                 changed = true;
                 const timedOut = data.reason === "timeout";
+                const subStatus =
+                  b.name === "Task" || b.name === "task" || b.subStatus
+                    ? (timedOut ? ("error" as const) : ("cancelled" as const))
+                    : b.subStatus;
                 return {
                   ...b,
                   status: "error" as const,
                   result: b.result || (timedOut ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)` : "(cancelled)"),
-                  subStatus: (b.name === "Task" || b.name === "task" || b.subStatus)
-                    ? (timedOut ? "error" : "cancelled") as const
-                    : b.subStatus,
+                  subStatus,
                 };
               });
               return changed ? { ...turn, blocks } : turn;
