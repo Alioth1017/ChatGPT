@@ -120,10 +120,10 @@ function NumInput({
   );
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
-    <label className="switch">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+    <label className="switch" style={disabled ? { opacity: 0.45, pointerEvents: "none" } : undefined}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
       <span className="track" />
       <span className="thumb" />
     </label>
@@ -516,15 +516,27 @@ function IndexingPanel({
         <div className="index-card-title">Codebase Indexing</div>
         <p className="row-desc">
           Embed codebase for improved contextual understanding and knowledge. Embeddings and metadata are
-          stored locally on your machine — your code never leaves your computer.
+          stored locally on your machine — your code never leaves your computer. The index persists across
+          restarts; only new or changed files are re-embedded.
         </p>
-        <div className="index-progress">
+        <div className="index-divider" />
+        <Row title="Enable Indexing" desc="When off, no embedding work runs (existing index is kept on disk and still searchable).">
+          <Toggle
+            checked={features.indexingEnabled !== false}
+            onChange={(v) => setFeatures({ indexingEnabled: v })}
+          />
+        </Row>
+        <div className="index-progress" style={{ opacity: features.indexingEnabled === false ? 0.5 : 1 }}>
           <div className="index-progress-pct">{pct}%</div>
           <div className="index-bar">
             <div className="index-bar-fill" style={{ width: `${pct}%` }} />
           </div>
           <div className="index-progress-meta">
-            {status.indexing ? `Indexing ${status.done} / ${status.total} files…` : `${status.files} files`}
+            {features.indexingEnabled === false
+              ? `Disabled - ${status.files} files on disk`
+              : status.indexing
+              ? `Indexing ${status.done} / ${status.total} files...`
+              : `${status.files} files`}
           </div>
         </div>
         <div className="index-divider" />
@@ -533,13 +545,13 @@ function IndexingPanel({
           <ModelSelect
             models={remoteEmbed}
             value={status.model}
-            onChange={(id) => !status.indexing && vscode.postMessage({ type: "setEmbedModel", modelId: id })}
+            onChange={(id) => !status.indexing && features.indexingEnabled !== false && vscode.postMessage({ type: "setEmbedModel", modelId: id })}
             customItems={models.map((m) => ({ value: m.id, label: m.name, desc: "local — runs on your machine" }))}
             style={{ maxWidth: 260 }}
           />
           <div className="index-actions" style={{ marginTop: 0, marginLeft: "auto" }}>
-            <button className="btn-secondary" disabled={status.indexing} onClick={() => vscode.postMessage({ type: "syncIndex" })}>
-              <Icon name="reset" /> {status.indexing ? "Syncing…" : "Sync"}
+            <button className="btn-secondary" disabled={status.indexing || features.indexingEnabled === false} onClick={() => vscode.postMessage({ type: "syncIndex" })}>
+              <Icon name="reset" /> {status.indexing ? "Syncing..." : "Sync"}
             </button>
             <button className="btn-secondary danger" disabled={status.indexing} onClick={() => vscode.postMessage({ type: "deleteIndex" })}>
               <Icon name="trash" /> Delete Index
@@ -549,13 +561,13 @@ function IndexingPanel({
       </div>
       <div className="index-card rows-card">
         <Row title="Index New Folders" desc="Automatically index any new folders added to the workspace">
-          <Toggle checked={features.indexNewFolders !== false} onChange={(v) => setFeatures({ indexNewFolders: v })} />
+          <Toggle checked={features.indexNewFolders !== false} onChange={(v) => setFeatures({ indexNewFolders: v })} disabled={features.indexingEnabled === false} />
         </Row>
         <Row title="Ignore Files in .cursorignore" desc="Files to exclude from indexing in addition to .gitignore">
           <button className="btn-secondary" onClick={() => vscode.postMessage({ type: "openCursorignore" })}>Edit</button>
         </Row>
         <Row title="Index Repositories for Instant Grep" desc="Automatically index repositories to speed up Grep searches. All data is stored locally.">
-          <Toggle checked={features.indexForGrep !== false} onChange={(v) => setFeatures({ indexForGrep: v })} />
+          <Toggle checked={features.indexForGrep !== false} onChange={(v) => setFeatures({ indexForGrep: v })} disabled={features.indexingEnabled === false} />
         </Row>
       </div>
       <DocsSection docs={docs} status={docsStatus} />

@@ -15,7 +15,7 @@ import { FeatureStore, MODEL_CATALOG } from "../stores/featureStore";
 import { listRules, listSkills } from "../context/workspaceContext";
 import { mcpManager } from "../integrations/mcpClient";
 import { BUILTIN_PERSONAS } from "../agent/personas";
-import { getStatus, onIndexStatus, buildIndex, deleteIndex, EMBED_MODELS } from "../agent/semanticIndex";
+import { getStatus, onIndexStatus, buildIndex, deleteIndex, warmIndex, EMBED_MODELS } from "../agent/semanticIndex";
 import { indexDocSource, deleteDocIndex, onDocsStatus, getDocsStatus, getDocLogs, type DocSource } from "../agent/docsIndex";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import * as llama from "../agent/llamacpp";
@@ -274,6 +274,7 @@ export class SettingsPanel {
             await this._sendFeatures();
             break;
           case "getIndexStatus":
+            await warmIndex(getWorkspaceRoot());
             this._panel.webview.postMessage({ type: "indexStatus", status: getStatus(getWorkspaceRoot()), models: EMBED_MODELS });
             this._sendDocs();
             break;
@@ -327,6 +328,7 @@ export class SettingsPanel {
             break;
           }
           case "syncIndex":
+            if (this.featureStore.get().indexingEnabled === false) break;
             buildIndex(getWorkspaceRoot()).catch(() => {});
             break;
           case "deleteIndex":
@@ -337,7 +339,7 @@ export class SettingsPanel {
             await this.featureStore.set({ ...f, embedModel: message.modelId });
             await applyEmbedModel(message.modelId);
             this._panel.webview.postMessage({ type: "indexStatus", status: getStatus(getWorkspaceRoot()), models: EMBED_MODELS });
-            buildIndex(getWorkspaceRoot()).catch(() => {}); // re-embed with new model
+            if (f.indexingEnabled !== false) buildIndex(getWorkspaceRoot()).catch(() => {});
             break;
           }
           case "llamacppGet":

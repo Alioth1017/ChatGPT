@@ -14,9 +14,9 @@ import { registerInlineReview } from './ui/inlineReview';
 import { SettingsPanel } from './ui/settingsPanel';
 import { FeatureStore } from './stores/featureStore';
 import { mcpManager } from './integrations/mcpClient';
-import { setIndexStorageDir, buildIndex } from './agent/semanticIndex';
+import { setIndexStorageDir } from './agent/semanticIndex';
 import { setDocsStorageDir, setDocSourcesProvider } from './agent/docsIndex';
-import { getWorkspaceRoot } from './context/workspaceUtils';
+import { initIndexWatch } from './agent/indexWatch';
 import { initLlamacpp, checkInstalled, loadModel, disposeLlamacpp } from './agent/llamacpp';
 import { initOAuth } from './agent/oauth';
 import { initUsage } from './stores/usageStore';
@@ -38,14 +38,13 @@ export function activate(context: vscode.ExtensionContext) {
   // renders instantly from the backend cache.
   initModelRegistry(featureStore, settingsManager);
 
-  // Local semantic index: model + vectors live in extension globalStorage.
-  // Kick off an initial background build (incremental; no-op if already fresh).
+  // Local semantic index: vectors in globalStorage; warm disk + incremental sync.
   setIndexStorageDir(context.globalStorageUri.fsPath);
   setDocsStorageDir(context.globalStorageUri.fsPath);
   setDocSourcesProvider(() => featureStore.get().docSources ?? []);
   applyEmbedModel(featureStore.get().embedModel || "minilm")
-    .then(() => buildIndex(getWorkspaceRoot()))
-    .catch(() => {});
+    .then(() => initIndexWatch(context, featureStore))
+    .catch(() => initIndexWatch(context, featureStore));
 
   // Connect any enabled MCP servers in the background.
   mcpManager.sync(featureStore.get().mcpServers).catch(() => {});

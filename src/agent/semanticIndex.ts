@@ -169,34 +169,61 @@ export async function embedTexts(texts: string[]): Promise<number[][] | null> {
 }
 
 // ---- Index lifecycle ----
+/** Stable workspace key so Windows drive-letter case / trailing slashes don't orphan the index. */
+function normRoot(root: string): string {
+  const r = path.resolve(root);
+  return process.platform === "win32" ? r.toLowerCase() : r;
+}
+
 function indexPath(root: string): string {
-  const id = crypto.createHash("sha1").update(root).digest("hex").slice(0, 16);
+  const id = crypto.createHash("sha1").update(normRoot(root)).digest("hex").slice(0, 16);
   const mid = getEmbedModelId().replace(/[^\w.-]+/g, "_");
   return path.join(storageDir!, `index-${id}-${mid}.json`);
 }
 
 let memIndex: IndexFile | null = null;
-let memRoot: string | null = null;
+let memRoot: string | null = null; // normRoot key
+let indexingEnabled = true;
+
+export function setIndexingEnabled(on: boolean): void {
+  indexingEnabled = on;
+}
+
+export function isIndexingEnabled(): boolean {
+  return indexingEnabled;
+}
 
 async function load(root: string): Promise<IndexFile> {
-  if (memIndex && memRoot === root) return memIndex;
+  const key = normRoot(root);
+  if (memIndex && memRoot === key) return memIndex;
   try {
     const raw = await fs.readFile(indexPath(root), "utf8");
     const parsed = JSON.parse(raw) as IndexFile;
-    if (parsed.model === getEmbedModelId()) {
+    if (parsed.model === getEmbedModelId() && parsed.files && Array.isArray(parsed.chunks)) {
       memIndex = parsed;
-      memRoot = root;
+      memRoot = key;
       return parsed;
     }
   } catch {}
   memIndex = { model: getEmbedModelId(), files: {}, chunks: [] };
-  memRoot = root;
+  memRoot = key;
   return memIndex;
 }
 
 async function save(root: string, idx: IndexFile): Promise<void> {
-  await fs.mkdir(storageDir!, { recursive: true });
+  if (!storageDir) return;
+  await fs.mkdir(storageDir, { recursive: true });
   await fs.writeFile(indexPath(root), JSON.stringify(idx), "utf8");
+  memIndex = idx;
+  memRoot = normRoot(root);
+}
+
+/** Load persisted index into memory (no embed work). Call on activate so status/UI show prior work. */
+export async function warmIndex(root: string): Promise<IndexStatus> {
+  if (!storageDir || !root) return getStatus(root);
+  await load(root);
+  emitStatus(root);
+  return getStatus(root);
 }
 
 function chunkFile(rel: string, text: string): { start: number; end: number; text: string }[] {
@@ -233,7 +260,7 @@ export function onIndexStatus(fn: (s: IndexStatus) => void): () => void {
   return () => statusSubs.delete(fn);
 }
 export function getStatus(root: string): IndexStatus {
-  const idx = memRoot === root ? memIndex : null;
+  const idx = memRoot === normRoot(root) ? memIndex : null;
   return {
     indexing,
     done: progress.done,
@@ -251,15 +278,138 @@ function emitStatus(root: string): void {
 /** Delete the persisted index for a workspace. */
 export async function deleteIndex(root: string): Promise<void> {
   memIndex = { model: getEmbedModelId(), files: {}, chunks: [] };
-  memRoot = root;
+  memRoot = normRoot(root);
   progress = { done: 0, total: 0 };
   try { await fs.unlink(indexPath(root)); } catch {}
   emitStatus(root);
 }
 
-/** (Re)build the index incrementally. Safe to call repeatedly; no-op if busy. */
+function isIndexableRel(rel: string): boolean {
+  return EMBED_EXTS.has(path.extname(rel).toLowerCase());
+}
+
+async function embedFileInto(idx: IndexFile, root: string, rel: string): Promise<boolean> {
+  const abs = path.join(root, rel);
+  let st;
+  try { st = await fs.stat(abs); } catch { return false; }
+  if (st.size > MAX_FILE_BYTES) return false;
+  let text: string;
+  try { text = await fs.readFile(abs, "utf8"); } catch { return false; }
+  // Drop old chunks for this path first.
+  idx.chunks = idx.chunks.filter((c) => c.path !== rel);
+  const pieces = chunkFile(rel, text);
+  if (pieces.length) {
+    const vecs = await embed(pieces.map((p) => p.text));
+    if (vecs) {
+      pieces.forEach((p, i) => idx.chunks.push({ path: rel, start: p.start, end: p.end, text: p.text, vec: vecs[i] }));
+    }
+  }
+  idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
+  return true;
+}
+
+/** Pending single-file updates while a full build runs (or coalesced watcher queue). */
+const pendingUpserts = new Map<string, Set<string>>(); // rootKey -> rel paths
+const pendingDeletes = new Map<string, Set<string>>();
+let drainRunning = false;
+
+function queueKey(root: string): string {
+  return normRoot(root);
+}
+
+/** Index/update one file immediately (or queue if full build busy). */
+export async function upsertFile(root: string, absOrRel: string): Promise<void> {
+  if (!storageDir || !indexingEnabled || !root) return;
+  const abs = path.isAbsolute(absOrRel) ? absOrRel : path.join(root, absOrRel);
+  const rel = path.relative(root, abs).split(path.sep).join("/");
+  if (!rel || rel.startsWith("..") || !isIndexableRel(rel)) return;
+  const key = queueKey(root);
+  if (indexing || drainRunning) {
+    if (!pendingUpserts.has(key)) pendingUpserts.set(key, new Set());
+    pendingUpserts.get(key)!.add(rel);
+    pendingDeletes.get(key)?.delete(rel);
+    return;
+  }
+  const idx = await load(root);
+  let st;
+  try { st = await fs.stat(abs); } catch {
+    await removeFile(root, abs);
+    return;
+  }
+  const hash = `${Math.round(st.mtimeMs)}:${st.size}`;
+  if (idx.files[rel] === hash || idx.files[rel] === `${st.mtimeMs}:${st.size}`) return;
+  await embedFileInto(idx, root, rel);
+  await save(root, idx);
+  emitStatus(root);
+}
+
+/** Remove a file from the index (delete/rename). */
+export async function removeFile(root: string, absOrRel: string): Promise<void> {
+  if (!storageDir || !indexingEnabled || !root) return;
+  const abs = path.isAbsolute(absOrRel) ? absOrRel : path.join(root, absOrRel);
+  const rel = path.relative(root, abs).split(path.sep).join("/");
+  if (!rel || rel.startsWith("..")) return;
+  const key = queueKey(root);
+  if (indexing || drainRunning) {
+    if (!pendingDeletes.has(key)) pendingDeletes.set(key, new Set());
+    pendingDeletes.get(key)!.add(rel);
+    pendingUpserts.get(key)?.delete(rel);
+    return;
+  }
+  const idx = await load(root);
+  if (!idx.files[rel] && !idx.chunks.some((c) => c.path === rel)) return;
+  idx.chunks = idx.chunks.filter((c) => c.path !== rel);
+  delete idx.files[rel];
+  await save(root, idx);
+  emitStatus(root);
+}
+
+async function drainPending(root: string): Promise<void> {
+  if (drainRunning || indexing || !indexingEnabled) return;
+  const key = queueKey(root);
+  const ups = pendingUpserts.get(key);
+  const dels = pendingDeletes.get(key);
+  if ((!ups || !ups.size) && (!dels || !dels.size)) return;
+  drainRunning = true;
+  try {
+    const idx = await load(root);
+    if (dels?.size) {
+      for (const rel of dels) {
+        idx.chunks = idx.chunks.filter((c) => c.path !== rel);
+        delete idx.files[rel];
+      }
+      dels.clear();
+    }
+    if (ups?.size) {
+      const list = [...ups];
+      ups.clear();
+      progress = { done: 0, total: list.length };
+      indexing = true;
+      emitStatus(root);
+      let done = 0;
+      for (const rel of list) {
+        await embedFileInto(idx, root, rel);
+        done++;
+        progress = { done, total: list.length };
+        emitStatus(root);
+      }
+      indexing = false;
+    }
+    await save(root, idx);
+    emitStatus(root);
+  } finally {
+    drainRunning = false;
+    indexing = false;
+    // More events may have arrived.
+    if ((pendingUpserts.get(key)?.size || 0) + (pendingDeletes.get(key)?.size || 0) > 0) {
+      void drainPending(root);
+    }
+  }
+}
+
+/** (Re)build the index incrementally. Only re-embeds changed files. No-op if disabled/busy. */
 export async function buildIndex(root: string, onProgress?: (done: number, total: number) => void): Promise<void> {
-  if (!storageDir || indexing) return;
+  if (!storageDir || !root || indexing || !indexingEnabled) return;
   indexing = true;
   progress = { done: 0, total: 0 };
   emitStatus(root);
@@ -276,41 +426,43 @@ export async function buildIndex(root: string, onProgress?: (done: number, total
       try { st = await fs.stat(f); } catch { continue; }
       if (st.size > MAX_FILE_BYTES) continue;
       seen.add(rel);
-      const hash = `${st.mtimeMs}:${st.size}`;
-      if (idx.files[rel] !== hash) targets.push(rel);
+      const hash = `${Math.round(st.mtimeMs)}:${st.size}`;
+      const prev = idx.files[rel];
+      // Accept either rounded or raw mtime strings from older indexes.
+      if (prev !== hash && prev !== `${st.mtimeMs}:${st.size}`) targets.push(rel);
     }
-    // Drop chunks for deleted/changed files.
     const changed = new Set(targets);
     idx.chunks = idx.chunks.filter((c) => seen.has(c.path) && !changed.has(c.path));
     for (const rel of Object.keys(idx.files)) {
       if (!seen.has(rel)) delete idx.files[rel];
     }
 
+    // Nothing to do — still save cleaned deletions if any, emit status.
+    if (!targets.length) {
+      await save(root, idx);
+      return;
+    }
+
     let done = 0;
     progress = { done: 0, total: targets.length };
     emitStatus(root);
     for (const rel of targets) {
-      const abs = path.join(root, rel);
-      let text: string;
-      try { text = await fs.readFile(abs, "utf8"); } catch { done++; continue; }
-      const pieces = chunkFile(rel, text);
-      if (pieces.length) {
-        const vecs = await embed(pieces.map((p) => p.text));
-        if (vecs) {
-          pieces.forEach((p, i) => idx.chunks.push({ path: rel, start: p.start, end: p.end, text: p.text, vec: vecs[i] }));
-        }
-      }
-      const st = await fs.stat(abs).catch(() => null);
-      if (st) idx.files[rel] = `${st.mtimeMs}:${st.size}`;
+      await embedFileInto(idx, root, rel);
+      // Prefer stable rounded hash going forward.
+      const st = await fs.stat(path.join(root, rel)).catch(() => null);
+      if (st) idx.files[rel] = `${Math.round(st.mtimeMs)}:${st.size}`;
       done++;
       progress = { done, total: targets.length };
       onProgress?.(done, targets.length);
       emitStatus(root);
+      // Persist periodically so reopen mid-index keeps progress.
+      if (done % 25 === 0) await save(root, idx);
     }
     await save(root, idx);
   } finally {
     indexing = false;
     emitStatus(root);
+    void drainPending(root);
   }
 }
 

@@ -221,6 +221,8 @@ export interface FeatureConfig {
 	approvalPolicy: ApprovalPolicy;
 	/** External documentation sources indexed for @Docs mentions. */
 	docSources: DocSource[];
+	/** Master switch for semantic codebase indexing. */
+	indexingEnabled: boolean;
 	/** Automatically index newly added workspace folders. */
 	indexNewFolders: boolean;
 	/** Index repositories to speed up grep searches (all data local). */
@@ -262,6 +264,7 @@ const DEFAULTS: FeatureConfig = {
 	webFetchEnabled: true,
 	approvalPolicy: DEFAULT_APPROVAL,
 	docSources: [],
+	indexingEnabled: true,
 	indexNewFolders: true,
 	indexForGrep: true,
 };

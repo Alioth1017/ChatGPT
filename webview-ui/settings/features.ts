@@ -265,6 +265,7 @@ export interface FeatureConfig {
   webSearchEnabled: boolean;
   webFetchEnabled: boolean;
   approvalPolicy: ApprovalPolicy;
+  indexingEnabled: boolean;
   indexNewFolders: boolean;
   indexForGrep: boolean;
 }
@@ -350,6 +351,7 @@ export const EMPTY_FEATURES: FeatureConfig = {
   webSearchEnabled: true,
   webFetchEnabled: true,
   approvalPolicy: DEFAULT_APPROVAL,
+  indexingEnabled: true,
   indexNewFolders: true,
   indexForGrep: true,
 };

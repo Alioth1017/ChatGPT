@@ -13,7 +13,7 @@ import { spawn } from "child_process";
 import { safePath, getWorkspaceRoot } from "../../context/workspaceUtils";
 import { defineTool } from "./types";
 import { STOP, walk, globToRe, rgAvailable } from "./shared";
-import { search as semanticIndexSearch, buildIndex, isIndexing } from "../semanticIndex";
+import { search as semanticIndexSearch, buildIndex, isIndexing, isIndexingEnabled } from "../semanticIndex";
 import { searchDocs, listDocSources } from "../docsIndex";
 
 // Minimal ripgrep --type -> file-extension map for the node fallback.
@@ -170,7 +170,7 @@ export const semanticSearchTool = defineTool("SemanticSearch", false, async (inp
   const root = getWorkspaceRoot();
 
   // Build/refresh index on demand (incremental; cheap if already fresh).
-  if (!isIndexing()) buildIndex(root).catch(() => {});
+  if (isIndexingEnabled() && !isIndexing()) buildIndex(root).catch(() => {});
 
   // Scope by target_directories (prefix match on workspace-relative paths).
   const dirs: string[] = Array.isArray(input.target_directories) ? input.target_directories : [];
