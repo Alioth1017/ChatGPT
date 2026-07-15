@@ -43,7 +43,14 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   if (abortSignal?.aborted) return { output: "(grep aborted)" };
   const root = getWorkspaceRoot();
   const mode: string = input.output_mode || "content";
-  const target = input.path ? safePath(input.path) : ".";
+  let target = ".";
+  if (input.path) {
+    try {
+      target = safePath(input.path); // spawn arg — spaces OK without shell quoting
+    } catch (e) {
+      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
   const cap = Math.max(1, Math.min(Number(input.head_limit) || 200, 2000));
   const skip = Math.max(0, Number(input.offset) || 0);
   const pattern = String(input.pattern ?? "");
@@ -119,7 +126,14 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   }
 
   // Node fallback (no ripgrep available). Honor path/glob/type/-A/-B/-C/multiline.
-  const scopeRoot = input.path ? safePath(input.path) : root;
+  let scopeRoot = root;
+  if (input.path) {
+    try {
+      scopeRoot = safePath(input.path);
+    } catch (e) {
+      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
   const all: string[] = [];
   await walk(scopeRoot, all, 0, false, abortSignal, 15_000);
   if (abortSignal?.aborted) return { output: "(grep aborted)" };
@@ -235,7 +249,13 @@ export const semanticSearchTool = defineTool("SemanticSearch", false, async (inp
   // Scope by target_directories (prefix match on workspace-relative paths).
   const dirs: string[] = Array.isArray(input.target_directories) ? input.target_directories : [];
   const prefixes = dirs
-    .map((d) => path.relative(root, safePath(String(d))).split(path.sep).join("/"))
+    .map((d) => {
+      try {
+        return path.relative(root, safePath(String(d))).split(path.sep).join("/");
+      } catch {
+        return "";
+      }
+    })
     .filter((p) => p && !p.startsWith(".."));
   const filter = prefixes.length
     ? (rel: string) => prefixes.some((p) => rel === p || rel.startsWith(p + "/"))

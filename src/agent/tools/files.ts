@@ -27,7 +27,12 @@ const IMAGE_MIME: Record<string, string> = {
 // ---- Read ----
 export const readFileTool = defineTool("Read", false, async (input) => {
   if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  const p = safePath(input.path);
+  let p: string;
+  try {
+    p = safePath(input.path);
+  } catch (e) {
+    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+  }
   const ext = path.extname(p).toLowerCase();
 
   // Image files: return a base64 image block so it reaches the model.
@@ -83,7 +88,12 @@ export const readFileTool = defineTool("Read", false, async (input) => {
 // ---- ListDir ----
 export const listDirTool = defineTool("ListDir", false, async (input) => {
   try {
-    const p = safePath(input.path ?? ".");
+    let p: string;
+    try {
+      p = safePath(input.path ?? ".");
+    } catch (e) {
+      return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+    }
     const entries = await fs.readdir(p, { withFileTypes: true });
     const out =
       entries
@@ -100,9 +110,14 @@ export const listDirTool = defineTool("ListDir", false, async (input) => {
 // ---- Glob ----
 export const globTool = defineTool("Glob", false, async (input, abortSignal) => {
   try {
-    const root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
+    let root: string;
+    try {
+      root = input.target_directory ? safePath(input.target_directory) : getWorkspaceRoot();
+    } catch (e) {
+      return { output: `error: invalid target_directory: ${e instanceof Error ? e.message : String(e)}` };
+    }
     // Only walk ignored dirs when the pattern explicitly targets them
-    // (e.g. "**/node_modules/**") — otherwise node_modules hangs the tool.
+    // (e.g. "**/node_modules/**") - otherwise node_modules hangs the tool.
     let pattern: string = String(input.glob_pattern ?? "");
     if (pattern && !pattern.startsWith("**/")) pattern = "**/" + pattern;
     const wantsIgnored = /node_modules|\.git|[/\\]dist[/\\]|[/\\]out[/\\]|[/\\]build[/\\]/.test(pattern);
@@ -171,7 +186,12 @@ function blockedInMultitask(ctx?: ToolContext): boolean {
 const editExecute: Tool["execute"] = async (input, _signal, _callId, ctx) => {
   if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
   if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  const p = safePath(input.path);
+  let p: string;
+  try {
+    p = safePath(input.path);
+  } catch (e) {
+    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+  }
   let existedBefore = false;
   try {
     await fs.access(p);
@@ -250,7 +270,12 @@ export const writeTool = defineTool("Write", true, editExecute);
 export const deleteFileTool = defineTool("Delete", true, async (input, _signal, _callId, ctx) => {
   if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
   if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
-  const p = safePath(input.path);
+  let p: string;
+  try {
+    p = safePath(input.path);
+  } catch (e) {
+    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+  }
   let before = "";
   try {
     before = await fs.readFile(p, "utf8");
@@ -326,7 +351,12 @@ export const editNotebookTool = defineTool("EditNotebook", true, async (input, _
   const oldString = String(input?.old_string ?? "");
   const newString = String(input?.new_string ?? "");
 
-  const abs = safePath(target);
+  let abs: string;
+  try {
+    abs = safePath(target);
+  } catch (e) {
+    return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
+  }
 
   // Read (or scaffold) the notebook JSON.
   let nb: any;

@@ -47,33 +47,64 @@ function buildNotify(input: any, ctx: any): ShellNotify | undefined {
   };
 }
 
+/** Quote a filesystem path for the session shell (spaces, quotes, unicode). */
+function quotePath(p: string): string {
+  if (isWin) {
+    // PowerShell single-quoted literal; escape ' by doubling. Drop trailing
+    // backslash that would escape the closing quote if we ever used doubles.
+    return `'${p.replace(/'/g, "''")}'`;
+  }
+  // bash: single-quote with '\'' for embedded quotes
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
- * Frame a command so the session always prints a unique sentinel with exit code.
- * PowerShell: use `if ($?)` — `$LASTEXITCODE` is often $null for native/cmdlets
- * and would never emit a sentinel (classic hang).
+ * Frame a command so the session ALWAYS prints a sentinel with exit code.
+ *
+ * Critical: do NOT paste the user command raw into the script. Paths with
+ * spaces, unclosed quotes, or bad syntax leave PowerShell waiting for more
+ * input forever (no sentinel → tool looks "stuck"). Instead base64-encode the
+ * command and Invoke-Expression / bash -c it inside try/catch/finally so
+ * parse errors still emit the sentinel and free the session.
  */
 function wrapCommand(command: string, cd: string): string {
+  const b64 = Buffer.from(command, "utf8").toString("base64");
   if (isWin) {
-    const loc = cd
-      ? `Push-Location -LiteralPath '${cd.replace(/'/g, "''")}'; try { `
-      : "";
-    const endLoc = cd ? ` } finally { Pop-Location } ` : " ";
-    // Always write the sentinel, even if the command throws.
-    // Use [Console]::Out so the line is not stuck in PowerShell's output pipeline.
+    const cdBlock = cd
+      ? `Push-Location -LiteralPath ${quotePath(cd)}; $__oc_pop = $true; `
+      : `$__oc_pop = $false; `;
+    // Decode → Invoke-Expression inside try; sentinel always in finally.
+    // $? / $LASTEXITCODE after IEX covers native cmds and cmdlets.
     return (
-      `${loc}${command}${endLoc}\n` +
-      `if ($?) { [Console]::Out.WriteLine("${SENTINEL}:0") } else { ` +
-      `$__oc = if ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne "") { $LASTEXITCODE } else { 1 }; ` +
-      `[Console]::Out.WriteLine("${SENTINEL}:$__oc") }\n`
+      `${cdBlock}` +
+      `$__oc_ok = $false; $__oc_code = 1; ` +
+      `try { ` +
+      `$__oc_cmd = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64}')); ` +
+      `Invoke-Expression -Command $__oc_cmd; ` +
+      `if ($?) { $__oc_ok = $true; $__oc_code = 0 } ` +
+      `elseif ($null -ne $LASTEXITCODE -and "$LASTEXITCODE" -ne '') { $__oc_code = [int]$LASTEXITCODE } ` +
+      `else { $__oc_code = 1 } ` +
+      `} catch { ` +
+      `[Console]::Error.WriteLine($_.Exception.Message); $__oc_ok = $false; $__oc_code = 1 ` +
+      `} finally { ` +
+      `if ($__oc_pop) { Pop-Location -ErrorAction SilentlyContinue }; ` +
+      `if ($__oc_ok) { [Console]::Out.WriteLine("${SENTINEL}:0") } ` +
+      `else { [Console]::Out.WriteLine("${SENTINEL}:$__oc_code") } ` +
+      `}\n`
     );
   }
-  const push = cd ? `pushd '${cd.replace(/'/g, `'\\''`)}' >/dev/null 2>&1 || true\n` : "";
+  // bash: decode to a temp eval so spaces/quotes never break the outer script.
+  // Always print sentinel even if eval fails (set +e).
+  const push = cd ? `pushd ${quotePath(cd)} >/dev/null 2>&1 || true\n` : "";
   const pop = cd ? `popd >/dev/null 2>&1 || true\n` : "";
   return (
-    `${push}${command}\n` +
+    `set +e\n` +
+    `${push}` +
+    `__oc_cmd=$(printf '%s' '${b64}' | base64 -d 2>/dev/null || printf '%s' '${b64}' | base64 -D 2>/dev/null)\n` +
+    `eval "$__oc_cmd"\n` +
     `__oc_rc=$?\n` +
     `${pop}` +
-    `echo "${SENTINEL}:$__oc_rc"\n`
+    `printf '%s\\n' "${SENTINEL}:$__oc_rc"\n`
   );
 }
 
@@ -171,7 +202,20 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
   };
   abortSignal?.addEventListener("abort", onAbort);
 
-  const cd = input.working_directory ? safePath(input.working_directory) : "";
+  let cd = "";
+  if (input.working_directory) {
+    try {
+      cd = safePath(String(input.working_directory));
+    } catch (e) {
+      abortSignal?.removeEventListener("abort", onAbort);
+      sh.done = true;
+      sh.exitCode = 1;
+      releaseQueue();
+      return {
+        output: `error: invalid working_directory: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+  }
   const wrapped = wrapCommand(command, cd);
 
   try {

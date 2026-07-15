@@ -35,12 +35,30 @@ export function getRecentFiles(): string[] {
   return out;
 }
 
+/**
+ * Resolve a workspace path safely. Handles spaces, unicode, and mixed
+ * separators. Does not shell-quote — callers that inject into a shell must
+ * quote the result (see shell.ts quotePath).
+ */
 export function safePath(rel: string): string {
   const root = getWorkspaceRoot();
-  const abs = path.isAbsolute(rel) ? rel : path.join(root, rel);
+  // Normalize user input: trim, unify slashes, drop surrounding quotes the
+  // model sometimes wraps around paths that contain spaces.
+  let s = String(rel ?? "").trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1);
+  }
+  s = s.replace(/\//g, path.sep);
+  const abs = path.isAbsolute(s) ? s : path.join(root, s);
   const norm = path.resolve(abs);
   const ws = path.resolve(root);
-  if (norm !== ws && !norm.startsWith(ws + path.sep)) {
+  // Case-insensitive root check on Windows (C:\ vs c:\).
+  const normKey = process.platform === "win32" ? norm.toLowerCase() : norm;
+  const wsKey = process.platform === "win32" ? ws.toLowerCase() : ws;
+  if (normKey !== wsKey && !normKey.startsWith(wsKey + path.sep)) {
     throw new Error(`path outside workspace: ${rel}`);
   }
   return norm;
