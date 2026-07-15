@@ -1275,6 +1275,27 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
 
     // Only deliver events to the webview when this conversation is on screen.
+    // High-frequency stream events are coalesced so postMessage + applyEvent
+    // cannot stall the extension host (looks like stuck tools/subagents).
+    type PendingUi = { event: AgentEvent; apply: boolean };
+    const uiPending = new Map<string, PendingUi>();
+    let uiTimer: ReturnType<typeof setTimeout> | undefined;
+    const flushUi = () => {
+      uiTimer = undefined;
+      if (!uiPending.size) return;
+      const batch = [...uiPending.values()];
+      uiPending.clear();
+      for (const { event, apply } of batch) {
+        if (apply) {
+          session.turns = applyEvent(session.turns, event as unknown as SharedAgentEvent);
+          this._schedulePersistTurns(convId, session);
+        }
+        this._view?.webview.postMessage({ type: "agentEvent", convId, event });
+      }
+    };
+    const scheduleUi = () => {
+      if (!uiTimer) uiTimer = setTimeout(flushUi, 48);
+    };
     const emit = (event: AgentEvent) => {
       if (event.type === "error") {
         SidebarProvider.log.appendLine(`[${new Date().toISOString()}] [agent] ${event.message}`);
@@ -1284,6 +1305,78 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       // Maintain authoritative host turns from the same reducer the UI uses, then
       // persist (throttled) so any webview reload restores the live state exactly.
       const ev = event as unknown as SharedAgentEvent;
+
+      // Coalesce stream deltas before applying / posting.
+      if (ev.type === "text-delta") {
+        const prev = uiPending.get("text");
+        if (prev && (prev.event as SharedAgentEvent).type === "text-delta") {
+          const p = prev.event as Extract<AgentEvent, { type: "text-delta" }>;
+          uiPending.set("text", {
+            event: { type: "text-delta", text: p.text + ev.text },
+            apply: true,
+          });
+        } else {
+          uiPending.set("text", { event, apply: true });
+        }
+        scheduleUi();
+        return;
+      }
+      if (ev.type === "thinking-delta") {
+        const prev = uiPending.get("think");
+        if (prev && (prev.event as SharedAgentEvent).type === "thinking-delta") {
+          const p = prev.event as Extract<AgentEvent, { type: "thinking-delta" }>;
+          uiPending.set("think", {
+            event: { type: "thinking-delta", text: p.text + ev.text },
+            apply: true,
+          });
+        } else {
+          uiPending.set("think", { event, apply: true });
+        }
+        scheduleUi();
+        return;
+      }
+      if (ev.type === "tool-call-args") {
+        uiPending.set(`args:${ev.callId}`, { event, apply: true });
+        scheduleUi();
+        return;
+      }
+      if (ev.type === "subagent-event") {
+        const child = ev.event as SharedAgentEvent;
+        if (child.type === "text-delta" || child.type === "thinking-delta" || child.type === "tool-call-args") {
+          const key =
+            child.type === "tool-call-args"
+              ? `sub:${ev.callId}:args:${(child as { callId: string }).callId}`
+              : `sub:${ev.callId}:${child.type}`;
+          if (child.type === "text-delta" || child.type === "thinking-delta") {
+            const prev = uiPending.get(key);
+            if (prev && (prev.event as SharedAgentEvent).type === "subagent-event") {
+              const pe = (prev.event as Extract<AgentEvent, { type: "subagent-event" }>).event;
+              if (pe.type === child.type) {
+                uiPending.set(key, {
+                  event: {
+                    type: "subagent-event",
+                    callId: ev.callId,
+                    event: { type: child.type, text: (pe as { text: string }).text + child.text },
+                  },
+                  apply: true,
+                });
+                scheduleUi();
+                return;
+              }
+            }
+          }
+          uiPending.set(key, { event, apply: true });
+          scheduleUi();
+          return;
+        }
+      }
+
+      // Discrete events: flush coalesced stream first (ordering).
+      if (uiPending.size) {
+        if (uiTimer) { clearTimeout(uiTimer); uiTimer = undefined; }
+        flushUi();
+      }
+
       if (ev.type === "run-status") {
         if (ev.status === "finished" || ev.status === "cancelled" || ev.status === "error") {
           session.turns = forceSettleOpenWork(

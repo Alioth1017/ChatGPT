@@ -30,9 +30,98 @@ const MULTITASK_REMINDER =
 	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
 
 const MAX_STEPS = 50;
+/** Foreground subagent hard budget (abort + settle). */
+const SUBAGENT_MAX_MS = 6 * 60_000;
+/** Background subagent hard budget. */
+const BG_SUBAGENT_MAX_MS = 10 * 60_000;
+/** Coalesce high-frequency stream UI events (ms). */
+const STREAM_COALESCE_MS = 40;
+
+/**
+ * Batch text/thinking/tool-args deltas so streaming cannot flood the host
+ * reducer + webview (main cause of UI freezes that look like "stuck" tools).
+ * Terminal events flush pending deltas first to preserve order.
+ */
+function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
+	const pending = new Map<string, AgentEvent>();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const flush = () => {
+		timer = undefined;
+		if (!pending.size) return;
+		const batch = [...pending.values()];
+		pending.clear();
+		for (const e of batch) {
+			try { raw(e); } catch { /* ignore */ }
+		}
+	};
+	const schedule = () => {
+		if (!timer) timer = setTimeout(flush, STREAM_COALESCE_MS);
+	};
+	return (event: AgentEvent) => {
+		if (event.type === "text-delta") {
+			const prev = pending.get("text");
+			if (prev && prev.type === "text-delta") {
+				pending.set("text", { type: "text-delta", text: prev.text + event.text });
+			} else {
+				pending.set("text", event);
+			}
+			schedule();
+			return;
+		}
+		if (event.type === "thinking-delta") {
+			const prev = pending.get("think");
+			if (prev && prev.type === "thinking-delta") {
+				pending.set("think", { type: "thinking-delta", text: prev.text + event.text });
+			} else {
+				pending.set("think", event);
+			}
+			schedule();
+			return;
+		}
+		if (event.type === "tool-call-args") {
+			// Latest full argsText wins (provider sends cumulative chunks).
+			pending.set(`args:${event.callId}`, event);
+			schedule();
+			return;
+		}
+		if (event.type === "subagent-event") {
+			const child = event.event;
+			// Coalesce nested high-freq child stream events per parent call.
+			if (child.type === "text-delta" || child.type === "thinking-delta" || child.type === "tool-call-args") {
+				const key =
+					child.type === "tool-call-args"
+						? `sub:${event.callId}:args:${child.callId}`
+						: `sub:${event.callId}:${child.type}`;
+				if (child.type === "text-delta" || child.type === "thinking-delta") {
+					const prev = pending.get(key);
+					if (prev && prev.type === "subagent-event" && prev.event.type === child.type) {
+						pending.set(key, {
+							type: "subagent-event",
+							callId: event.callId,
+							event: { type: child.type, text: (prev.event as { text: string }).text + child.text },
+						});
+					} else {
+						pending.set(key, event);
+					}
+				} else {
+					pending.set(key, event);
+				}
+				schedule();
+				return;
+			}
+		}
+		// Ordering: flush coalesced deltas before discrete events.
+		if (pending.size) {
+			if (timer) { clearTimeout(timer); timer = undefined; }
+			flush();
+		}
+		try { raw(event); } catch { /* ignore */ }
+	};
+}
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
-	const { apiBaseUrl, apiKey, model, prompt, attachments, history, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit } = opts;
+	const { apiBaseUrl, apiKey, model, prompt, attachments, history, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const emit = coalesceEmit(rawEmit);
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
 	// multitask is agentic (full tool access); treat it like agent for gating.
@@ -96,6 +185,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
+			const budgetMs = opts?.runInBackground ? BG_SUBAGENT_MAX_MS : SUBAGENT_MAX_MS;
+			let budgetHit = false;
+			const budgetTimer = setTimeout(() => {
+				budgetHit = true;
+				try { childAC.abort(); } catch { /* ignore */ }
+			}, budgetMs);
 			// Isolated chat: empty history, own context budget. Parent only gets
 			// the final summary string (tool result / run-result) — never sub steps.
 			const runP = runAgent({
@@ -120,9 +215,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				signal: childAC.signal,
 				emit: (e) => {
 					if (e.type === "run-result") finalText = e.text;
-					// UI stream only — not parent history.
+					// UI stream only — not parent history. Coalesced via parent emit.
 					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
+			}).finally(() => {
+				clearTimeout(budgetTimer);
 			});
 			// Background subagents return immediately; they keep streaming via emit.
 			if (opts?.runInBackground) {
@@ -131,8 +228,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// and capture its summary so it can be fed back into the loop on completion.
 				const idx = bgSubagents.length;
 				const tracked = runP
-					.then(() => ({ title, text: finalText || "(subagent finished with no summary)" }))
-					.catch((e) => ({ title, text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})` }))
+					.then(() => ({
+						title,
+						text: budgetHit
+							? `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`
+							: (finalText || "(subagent finished with no summary)"),
+					}))
+					.catch((e) => ({
+						title,
+						text: budgetHit
+							? `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`
+							: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
+					}))
 					.finally(() => {
 						parentSig.removeEventListener("abort", onParentAbort);
 						onHook?.("subagentStop", { subagent: title });
@@ -144,14 +251,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			try {
 				await runP;
 			} catch (e) {
+				if (budgetHit) return `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`;
 				if (childAC.signal.aborted || parentSig.aborted) {
 					return "(subagent cancelled)";
 				}
 				return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
 			} finally {
+				clearTimeout(budgetTimer);
 				parentSig.removeEventListener("abort", onParentAbort);
 				onHook?.("subagentStop", { subagent: subagentName || "subagent" });
 			}
+			if (budgetHit) return `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`;
 			if (childAC.signal.aborted || parentSig.aborted) return "(subagent cancelled)";
 			return finalText || "(subagent finished with no summary)";
 		};
@@ -537,7 +647,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			});
 
 			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
-			const ro: Promise<void>[] = [];
+			const completedUi = new Set<number>();
+			const finishUi = (i: number) => {
+				if (completedUi.has(i) || !results[i]) return;
+				completedUi.add(i);
+				const { call } = parsed[i];
+				const r = results[i];
+				// Surface completion as soon as the tool settles — don't wait for
+				// siblings. Prevents one slow tool from freezing the whole card strip.
+				emit({
+					type: "tool-call-completed",
+					callId: call.id,
+					name: call.name,
+					status: r.status,
+					result: r.output,
+					diff: r.diff,
+					startLine: r.startLine,
+					endLine: r.endLine,
+				});
+			};
 
 			const exec = async (i: number) => {
 				const { call, input, badArgs } = parsed[i];
@@ -546,6 +674,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						status: "error",
 						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${call.name} calls.`,
 					};
+					finishUi(i);
 					return;
 				}
 				// MCP tool dispatch.
@@ -653,44 +782,64 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (status === "completed" && isEditTool && onAfterEdit) {
 						onAfterEdit(String(input?.path ?? ""));
 					}
+					finishUi(i);
 				} catch (e) {
 					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
+					finishUi(i);
 				}
 			};
 
+			// Early-exit paths inside exec that set results without finishUi.
+			const wrapExec = async (i: number) => {
+				try {
+					await exec(i);
+				} finally {
+					// Guarantee UI settles even if a branch forgot finishUi.
+					if (results[i]) finishUi(i);
+					else {
+						results[i] = { status: "error", output: "error: tool produced no result" };
+						finishUi(i);
+					}
+				}
+			};
+
+			// Cap parallel RO tools so a burst of Grep/Glob/Task can't thrash CPU/IO.
+			// Worker pool (not batch-wait): a long Task doesn't block the next free slot.
+			const RO_CONCURRENCY = 8;
+			const roIdx: number[] = [];
 			for (let i = 0; i < parsed.length; i++) {
 				const name = parsed[i].call.name;
 				const tool = TOOLS[name];
-				// Run read-only built-in tools in parallel; MCP + mutating tools serialize below.
-				if (tool && !tool.mutating && !name.startsWith("mcp__")) {
-					ro.push(exec(i));
-				}
+				if (tool && !tool.mutating && !name.startsWith("mcp__")) roIdx.push(i);
 			}
-			await Promise.all(ro);
+			if (roIdx.length) {
+				let cursor = 0;
+				const workers = Array.from(
+					{ length: Math.min(RO_CONCURRENCY, roIdx.length) },
+					async () => {
+						while (cursor < roIdx.length) {
+							const i = roIdx[cursor++];
+							await wrapExec(i);
+						}
+					},
+				);
+				await Promise.all(workers);
+			}
 			for (let i = 0; i < parsed.length; i++) {
 				const name = parsed[i].call.name;
 				const tool = TOOLS[name];
 				if (!tool || tool.mutating || name.startsWith("mcp__")) {
-					await exec(i);
+					await wrapExec(i);
 				}
 			}
 
 			for (let i = 0; i < parsed.length; i++) {
 				const { call } = parsed[i];
-				const r = results[i];
+				const r = results[i] ?? { status: "error" as const, output: "error: tool produced no result" };
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				emit({
-					type: "tool-call-completed",
-					callId: call.id,
-					name: call.name,
-					status: r.status,
-					result: r.output,
-					diff: r.diff,
-					startLine: r.startLine,
-					endLine: r.endLine,
-				});
+				// History in call order (model expects stable tool-result sequencing).
 				history.push({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
 			}
 			// After launching background Task(s), wait for that wave before calling the

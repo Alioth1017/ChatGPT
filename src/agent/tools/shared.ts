@@ -110,8 +110,14 @@ export function setToolTimeoutOverrides(sec: Record<string, number> | undefined)
  * Always settles (never hangs) even if `p` never resolves.
  */
 export function withToolTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  // Guard against a never-settling promise with no explicit limit.
-  const limit = !ms || ms <= 0 ? 120_000 : ms;
+  // ms <= 0: no outer race (Task/AskQuestion manage their own lifetime).
+  // Still attach a settle handler so a late rejection cannot become unhandled.
+  if (!ms || ms <= 0) {
+    return Promise.resolve(p).catch((e) => {
+      throw e instanceof Error ? e : new Error(String(e));
+    });
+  }
+  const limit = ms;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {

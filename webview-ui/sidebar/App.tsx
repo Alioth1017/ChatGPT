@@ -882,6 +882,15 @@ export function App() {
   };
 
   React.useEffect(() => {
+    // rAF-batch stream-driven re-renders so tool/args/text deltas don't thrash React.
+    let raf = 0;
+    const scheduleForce = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        force();
+      });
+    };
     const handler = (event: MessageEvent<InMessage>) => {
       const msg = event.data;
       switch (msg.type) {
@@ -1006,12 +1015,23 @@ export function App() {
               // Keep the rendered error block; persist so the chat survives reloads.
               s.status = { text: "Error: " + ev.message, error: true };
               post({ type: "persistTurns", convId: msg.convId, turns: s.turns });
-            } else if (ev.type === "mode-changed") {
+            }             else if (ev.type === "mode-changed") {
               setMode(ev.mode);
               post({ type: "setMode", mode: ev.mode });
             }
           }
-          force();
+          // Immediate paint on settle / tool complete; coalesce stream deltas.
+          if (
+            settled ||
+            ev.type === "tool-call-completed" ||
+            ev.type === "tool-call-started" ||
+            ev.type === "error" ||
+            ev.type === "run-result"
+          ) {
+            force();
+          } else {
+            scheduleForce();
+          }
           break;
         }
       }
@@ -1029,6 +1049,7 @@ export function App() {
     window.addEventListener("beforeunload", flush);
     post({ type: "ready" });
     return () => {
+      if (raf) cancelAnimationFrame(raf);
       flush();
       window.removeEventListener("message", handler);
       window.removeEventListener("pagehide", flush);
