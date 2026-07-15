@@ -353,6 +353,74 @@ function ModePicker({ mode, onMode }: { mode: Mode; onMode: (m: Mode) => void })
   );
 }
 
+/** True when max_context was injected as a fallback (no catalog preset). */
+function isFallbackContext(m?: ModelDef): boolean {
+  if (!m) return false;
+  const o = m.options.find((x) => x.key === "max_context");
+  if (!o?.values) return false;
+  return o.values.length >= 5 && o.values.includes("32k") && o.values.includes("1m");
+}
+
+/** Context-size dropdown beside model picker for models without catalog presets. */
+function ContextPicker({
+  model,
+  onSave,
+}: {
+  model?: ModelDef;
+  onSave: (modelId: string, options: ModelOption[]) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const btnRef = React.useRef<HTMLButtonElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const [style, setStyle] = React.useState<React.CSSProperties>({});
+  const opt = model?.options.find((o) => o.key === "max_context");
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  if (!model || !opt || !isFallbackContext(model)) return null;
+  const values = opt.values || [];
+  const openMenu = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setStyle({ position: "fixed", left: r.left, bottom: window.innerHeight - r.top + 4, zIndex: 200 });
+    setOpen(true);
+  };
+  return (
+    <>
+      <button ref={btnRef} type="button" className="ctx-chip" title="Context window size" onClick={() => (open ? setOpen(false) : openMenu())}>
+        {opt.value || "ctx"}
+      </button>
+      {open && createPortal(
+        <div ref={menuRef} className="mode-dropdown ctx-dropdown" style={style} onClick={(e) => e.stopPropagation()}>
+          {values.map((v) => (
+            <button
+              key={v}
+              type="button"
+              className={"mode-item" + (v === opt.value ? " active" : "")}
+              onClick={() => {
+                const next = model.options.map((o) => (o.key === "max_context" ? { ...o, value: v } : o));
+                onSave(model.id, next);
+                setOpen(false);
+              }}
+            >
+              {v}
+            </button>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </>
+  );
+}
+
 /** Short summary of a model's options, e.g. "Low · Thinking". */
 function optionSummary(opts: ModelOption[]): string {
   const parts: string[] = [];
@@ -1550,10 +1618,14 @@ export function Composer({
         <div className="composer-bar">
           <ModePicker mode={mode} onMode={onMode} />
           <ModelPicker models={models} modelList={modelList} selected={selectedModel} onSelect={onSelectModel} onSaveOptions={onSaveModelOptions} onResetOptions={onResetModelOptions} />
+          {(() => {
+            const sel = modelList.find((m) => m.id === selectedModel);
+            return <ContextPicker model={sel} onSave={onSaveModelOptions} />;
+          })()}
           <div className="right">
             {!editing && (() => {
               const sel = modelList.find((m) => m.id === selectedModel);
-              const total = parseContextSize(sel?.options.find((o) => o.key === "max_context")?.value) || 200_000;
+              const total = parseContextSize(sel?.options.find((o) => o.key === "max_context")?.value) || 128_000;
               return <ContextRing used={usedTokens ?? 0} total={total} />;
             })()}
             <button

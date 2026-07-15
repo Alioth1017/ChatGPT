@@ -96,8 +96,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
-			// Isolated context: empty history, own budget, no parent chat steps.
-			// Parent only receives the final summary string (run-result), never sub history.
+			// Isolated chat: empty history, own context budget. Parent only gets
+			// the final summary string (tool result / run-result) — never sub steps.
 			const runP = runAgent({
 				apiBaseUrl,
 				apiKey,
@@ -119,13 +119,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				isSubagent: true,
 				signal: childAC.signal,
 				emit: (e) => {
-					if (e.type === "run-result") {
-						finalText = e.text;
-					}
-					// UI-only stream; never re-inject subagent steps into parent history.
-					if (callId) {
-						emit({ type: "subagent-event", callId, event: e });
-					}
+					if (e.type === "run-result") finalText = e.text;
+					// UI stream only — not parent history.
+					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
 			});
 			// Background subagents return immediately; they keep streaming via emit.
@@ -363,8 +359,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// so the compaction persists across steps and runs.
 			// Trigger on either the local estimate or the provider-reported prompt
 			// size of the previous request (authoritative when available).
-			if (budget > 0 && Math.max(stepsTokens(history) + Math.ceil(system.length / 4), lastPrompt) > budget * 0.8) {
-				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * 0.3));
+			// Smart summarize at 80% of usable context budget.
+			const usedEst = stepsTokens(history) + Math.ceil(system.length / 4);
+			const fill = Math.max(usedEst, lastPrompt);
+			if (budget > 0 && fill >= budget * 0.8) {
+				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * 0.35));
 				if (prefix.length >= 2) {
 					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
 					// Visible in-chat marker while the summary is being generated.
