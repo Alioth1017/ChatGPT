@@ -4,6 +4,22 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.4] - 2026-07-15
+
+### Added
+
+- Per-tool hard timeouts so hung Grep/Glob/Shell/etc. cannot block the agent loop forever
+- Abort-signal support for long-running tools (walk, grep, shell) so Stop cancels mid-work
+- Configurable per-tool timeout seconds in Settings → Agents
+- GPU-accelerated local embeddings when available (DirectML / CUDA / CoreML / WebGPU), with CPU fallback
+- Indexing page shows GPU/CPU badge plus model and runtime technical details (repo, dtype, ONNX EP, platform)
+- Stricter indexable-file filters (source extensions only; skip lockfiles, minified bundles, binaries)
+
+### Changed
+
+- Expanded ignored directories for tools and indexing (`node_modules`, build caches, venvs, vendor, etc.)
+- Semantic index walk and file watcher skip non-source trees earlier for faster indexing
+
 ## [0.0.3] - 2026-07-15
 
 ### Added
