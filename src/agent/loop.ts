@@ -228,6 +228,26 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			return done.length;
 		};
 
+		const bgPending = () => bgSubagents.length > bgReported;
+
+		/** Block until all unreported background subagents settle, then flush into history. */
+		const awaitPendingBg = async (): Promise<boolean> => {
+			if (!bgPending()) return false;
+			flushSettledBg();
+			if (!bgPending()) return true;
+			const pending = bgSubagents.slice(bgReported);
+			const n = pending.length;
+			emit({ type: "run-status", status: "running" });
+			emit({
+				type: "shell-notify",
+				message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…`,
+			});
+			await Promise.allSettled(pending);
+			if (signal.aborted) return true;
+			flushSettledBg();
+			return true;
+		};
+
 		// Summarize older steps with the same model (non-streaming aggregate) so
 		// compaction keeps task intent, decisions, file paths and unfinished work.
 		const summarizeSteps = async (steps: Step[]): Promise<string> => {
@@ -385,6 +405,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					});
 					continue;
 				}
+				// In-flight background Task subagents: wait + feed results before any
+				// "continue" nudge. Otherwise the model gets another turn while workers
+				// are still running and often spawns a second wave of subagents.
+				if (bgPending()) {
+					await awaitPendingBg();
+					if (signal.aborted) {
+						emit({ type: "run-status", status: "cancelled" });
+						return;
+					}
+					continue;
+				}
 				// Truncated response (hit max output tokens): the model didn't choose to
 				// stop — never treat this as a final answer. Ask it to continue.
 				if (isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
@@ -424,24 +455,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						});
 						continue;
 					}
-				}
-				// Before truly finishing, if background subagents are still in flight (or
-				// completed but not yet reported), wait for them and feed their summaries
-				// back so the model continues its own loop and synthesizes the results.
-				if (bgSubagents.length > bgReported) {
-					// Report whatever already finished without blocking; only wait for the rest.
-					if (flushSettledBg() > 0) continue;
-					const pending = bgSubagents.slice(bgReported);
-					const n = pending.length;
-					emit({ type: "run-status", status: "running" });
-					emit({ type: "shell-notify", message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…` });
-					await Promise.allSettled(pending);
-					if (signal.aborted) {
-						emit({ type: "run-status", status: "cancelled" });
-						return;
-					}
-					flushSettledBg();
-					continue;
 				}
 				finalText = assistantText;
 				break;
@@ -586,6 +599,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					endLine: r.endLine,
 				});
 				history.push({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+			}
+			// After launching background Task(s), wait for that wave before calling the
+			// model again. Otherwise the next turn (or empty-turn / todo nudge) races
+			// ahead and the coordinator spawns more subagents while workers still run.
+			if (bgPending()) {
+				const launchedBg = parsed.some((p, i) => {
+					if (p.call.name !== "Task") return false;
+					const out = results[i]?.output || "";
+					return /Launched .+ in the background/i.test(out);
+				});
+				if (launchedBg) {
+					await awaitPendingBg();
+					if (signal.aborted) {
+						emit({ type: "run-status", status: "cancelled" });
+						return;
+					}
+				}
 			}
 		}
 
