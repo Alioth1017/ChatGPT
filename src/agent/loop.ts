@@ -9,7 +9,7 @@
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
-import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
+import { TOOLS, schemasForMode, toolsForMode, resetTodos, getTodos, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
@@ -703,8 +703,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
 				if (call.name.startsWith("mcp__")) {
-					if (!isAgentic()) {
-						// MCP tools may mutate; only allow in agentic modes.
+					if (!isAgentic() || mode === "multitask") {
+						// MCP tools may mutate; only allow in agentic modes. Multitask is a
+						// coordinator and must delegate MCP work to subagents.
 						results[i] = { status: "error", output: `MCP tools not allowed in ${mode} mode` };
 						return;
 					}
@@ -773,6 +774,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				const tool = TOOLS[call.name];
 				if (!tool || disabledToolNames.has(call.name)) {
 					results[i] = { status: "error", output: `unknown or disabled tool: ${call.name}` };
+					return;
+				}
+				// Multitask is a coordinator: it can read/search/manage todos but must
+				// never mutate files or the shell — delegate that to a subagent.
+				if (mode === "multitask" && !MULTITASK_TOOLS.has(call.name)) {
+					results[i] = {
+						status: "error",
+						output: `tool ${call.name} not allowed in multitask mode — delegate file/shell edits to a background subagent with the Task tool.`,
+					};
 					return;
 				}
 				if (!isAgentic() && !allowedNamesFor().has(call.name)) {

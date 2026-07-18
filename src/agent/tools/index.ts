@@ -70,12 +70,20 @@ export const EDIT_TOOLS = new Set(["StrReplace", "Write", "Delete", "EditNoteboo
 // WritePlan is exclusive to plan mode; it must never surface in agent/ask.
 const PLAN_ONLY = new Set(["WritePlan"]);
 
+// Multitask is a coordinator: it delegates to subagents (Task), manages todos,
+// and may read/search — but it must never mutate files or the shell itself.
+const MULTITASK_BLOCKED = new Set(["StrReplace", "Write", "Delete", "EditNotebook", "Shell"]);
+export const MULTITASK_TOOLS = new Set(
+  Object.keys(TOOLS).filter((name) => !MULTITASK_BLOCKED.has(name) && !PLAN_ONLY.has(name)),
+);
+
 export function toolsForMode(mode: Mode): Tool[] {
   return Object.entries(TOOLS)
     .filter(([name, t]) => {
       if (PLAN_ONLY.has(name)) return mode === "plan";
-      // ask + plan are read-only: no mutating tools. agent/multitask/debug: everything.
-      return mode === "agent" || mode === "multitask" || mode === "debug" ? true : !t.mutating;
+      if (mode === "multitask") return MULTITASK_TOOLS.has(name);
+      // ask + plan are read-only: no mutating tools. agent/debug: everything.
+      return mode === "agent" || mode === "debug" ? true : !t.mutating;
     })
     .map(([, t]) => t);
 }
