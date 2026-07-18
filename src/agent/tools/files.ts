@@ -238,6 +238,10 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 			}
 			start = off < 0 ? Math.max(1, totalLines + off + 1) : Math.max(1, Math.floor(off));
 		}
+		// Default line cap: whole-file reads shouldn't dump thousands of lines
+		// into context. Callers wanting more pass an explicit limit/offset.
+		const DEFAULT_MAX_LINES = 1500;
+		let capped = false;
 		if (input.limit !== undefined && input.limit !== null) {
 			const lim = Number(input.limit);
 			if (!Number.isFinite(lim) || lim < 1) {
@@ -246,16 +250,22 @@ export const readFileTool = defineTool("Read", false, async (input, abortSignal)
 			end = Math.min(totalLines, start + Math.floor(lim) - 1);
 		} else if (input.offset !== undefined && input.offset !== null) {
 			end = totalLines;
+		} else if (totalLines > DEFAULT_MAX_LINES) {
+			end = DEFAULT_MAX_LINES;
+			capped = true;
 		}
 		if (end < start) end = start;
 		if (start > totalLines) {
 			return { output: `error: offset ${start} past end of file (${totalLines} lines)` };
 		}
 
-		const out = lines
+		let out = lines
 			.slice(start - 1, end)
 			.map((l, idx) => `${start + idx}|${l}`)
 			.join("\n");
+		if (capped) {
+			out += `\n... (${totalLines - end} more lines - read with offset=${end + 1} to continue)`;
+		}
 		return { output: out, startLine: start, endLine: end };
 	} catch (e) {
 		return { output: readErrMsg(e, String((input as { path?: string })?.path ?? "")) };
@@ -275,13 +285,13 @@ export const listDirTool = defineTool("ListDir", false, async (input, abortSigna
 		const opts: { withFileTypes: true; signal?: AbortSignal } = { withFileTypes: true };
 		if (abortSignal) opts.signal = abortSignal;
 		const entries = await withAbortTimeout(fs.readdir(p, opts), READ_IO_MS, abortSignal, "ListDir");
-		const out =
-			entries
-				.filter((e) => !IGNORE.has(e.name))
-				.slice(0, 2_000)
-				.map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-				.join("\n") || "(empty)";
-		return { output: out };
+		const visible = entries.filter((e) => !IGNORE.has(e.name));
+		// Dirs first, then files — fewer tokens spent scanning, easier to navigate.
+		visible.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+		const shown = visible.slice(0, 300);
+		const extra = visible.length > shown.length ? `\n... (${visible.length - shown.length} more entries)` : "";
+		const out = shown.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join("\n") || "(empty)";
+		return { output: out + extra };
 	} catch (e) {
 		return { output: `error: ListDir failed: ${e instanceof Error ? e.message : String(e)}` };
 	}
@@ -441,32 +451,70 @@ export const strReplaceTool = defineTool("StrReplace", true, editExecute);
 export const writeTool = defineTool("Write", true, editExecute);
 
 // ---- Delete ----
-export const deleteFileTool = defineTool("Delete", true, async (input, _signal, _callId, ctx) => {
+const DELETE_IO_MS = 8_000;
+const DELETE_BACKUP_MAX = 2 * 1024 * 1024; // 2 MiB snapshot for undo
+
+export const deleteFileTool = defineTool("Delete", true, async (input, abortSignal, _callId, ctx) => {
 	if (blockedInMultitask(ctx)) return MULTITASK_BLOCK;
 	if (typeof input.path !== "string" || !input.path) return { output: "error: path is required and must be a string" };
+	if (abortSignal?.aborted) return { output: "error: aborted" };
+	const pathHint = String(input.path);
 	let p: string;
 	try {
-		p = safePath(input.path);
+		p = safePath(pathHint);
 	} catch (e) {
 		return { output: `error: invalid path: ${e instanceof Error ? e.message : String(e)}` };
 	}
-	let before = "";
+
+	// Stat first so missing/dir/network hangs fail fast (not on readFile of whole tree).
+	let st: Awaited<ReturnType<typeof fs.stat>> | undefined;
 	try {
-		before = await fs.readFile(p, "utf8");
-	} catch {}
-	// Schema: fail gracefully if the file doesn't exist / can't be deleted.
-	try {
-		await fs.unlink(p);
-	} catch (e: any) {
-		if (e?.code === "ENOENT") return { output: `error: ${input.path} does not exist` };
-		if (e?.code === "EISDIR" || e?.code === "EPERM" || e?.code === "EACCES") {
-			return { output: `error: cannot delete ${input.path}: ${e.code}` };
+		st = await withAbortTimeout(fs.stat(p), READ_STAT_MS, abortSignal, "stat");
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
+			return { output: `error: cannot access path (timed out or aborted): ${pathHint}` };
 		}
-		return { output: `error: cannot delete ${input.path}: ${e instanceof Error ? e.message : String(e)}` };
+		return { output: `error: ${pathHint} does not exist` };
+	}
+	if (st.isDirectory()) {
+		return { output: `error: path is a directory, not a file: ${pathHint}` };
+	}
+	if (abortSignal?.aborted) return { output: "error: aborted" };
+
+	// Optional undo snapshot — skip huge files so delete never hangs on a giant read.
+	let before = "";
+	if (st.size > 0 && st.size <= DELETE_BACKUP_MAX) {
+		try {
+			const readOpts = abortSignal ? { encoding: "utf8" as const, signal: abortSignal } : { encoding: "utf8" as const };
+			before = await withAbortTimeout(fs.readFile(p, readOpts), DELETE_IO_MS, abortSignal, "Delete backup");
+		} catch {
+			before = "";
+		}
+	}
+	if (abortSignal?.aborted) return { output: "error: aborted" };
+
+	try {
+		// fs.unlink has no AbortSignal in @types/node — race with withAbortTimeout.
+		await withAbortTimeout(fs.unlink(p), DELETE_IO_MS, abortSignal, "Delete");
+	} catch (e: any) {
+		const msg = e instanceof Error ? e.message : String(e);
+		if (msg.startsWith("timeout:") || msg.startsWith("aborted:")) {
+			return { output: `error: delete timed out or aborted (file locked or unreachable): ${pathHint}` };
+		}
+		if (e?.code === "ENOENT") return { output: `error: ${pathHint} does not exist` };
+		if (e?.code === "EISDIR" || e?.code === "EPERM" || e?.code === "EACCES" || e?.code === "EBUSY") {
+			return { output: `error: cannot delete ${pathHint}: ${e.code}` };
+		}
+		return { output: `error: cannot delete ${pathHint}: ${msg}` };
 	}
 	// Track as a change so the user can restore the deleted file.
-	pendingChanges.record(input.path, before, "", true);
-	return { output: `deleted ${input.path}` };
+	try {
+		pendingChanges.record(pathHint, before, "", true);
+	} catch {
+		/* ignore undo-tracking failures */
+	}
+	return { output: `deleted ${pathHint}` };
 });
 
 // ---- EditNotebook ----

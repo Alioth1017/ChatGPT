@@ -426,6 +426,8 @@ function SubagentChat({ block, onBack }: { block: import("./types").ToolBlock; o
   const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
   const running = !subDone && (block.status === "running" || !!block.subStatus || (block.subBlocks?.length ?? 0) > 0);
   const sub = block.subBlocks ?? [];
+  const taskPrompt = String(block.input?.prompt || "").trim();
+  const [promptOpen, setPromptOpen] = React.useState(false);
   return (
     <div className="subagent-view">
       <div className="subagent-view-head">
@@ -433,19 +435,26 @@ function SubagentChat({ block, onBack }: { block: import("./types").ToolBlock; o
           <Icon name="chevD" size={12} /> Back to chat
         </button>
         <span className="sub-readonly">{isReadonlySubagent(block.input) ? "read-only" : "agent"}</span>
-        <TimeoutBadge block={block} />
         {running && (
           <button className="sub-stop" onClick={() => post({ type: "cancelSubagent", callId: block.callId, reason: "user" })}>
             <Icon name="close" size={12} /> Stop
           </button>
         )}
       </div>
-      <div className="msg user">
+      <div className="msg user subagent-task-msg">
         <div className="role"><Icon name="task" /> Task</div>
-        <div className="bubble">
-          <div className="subagent-meta">{block.input?.description || "Subagent"} · {isReadonlySubagent(block.input) ? "Explore" : "Agent"}</div>
-          {block.input?.prompt && <Markdown text={String(block.input.prompt)} />}
-        </div>
+        {taskPrompt ? (
+          <div
+            className={"subagent-prompt" + (promptOpen ? " open" : " clamp")}
+            onClick={() => setPromptOpen((o) => !o)}
+            role="button"
+            title={promptOpen ? "Click to collapse" : "Click to expand"}
+          >
+            <Markdown text={taskPrompt} />
+          </div>
+        ) : (
+          <span className="subagent-prompt-empty">(no task prompt)</span>
+        )}
       </div>
       <div className="msg assistant">
         <div className="role"><Icon name="bot" /> Subagent</div>
@@ -800,6 +809,27 @@ export function App() {
     el.scrollTo({ top: el.scrollHeight - el.clientHeight, behavior: "smooth" });
     window.setTimeout(() => { selfScrollRef.current = false; }, 450);
   }, [setStick]);
+
+  // Returning to the main chat (close subagent tab / Back button): snap to bottom.
+  // The chat list is remounted, so wait for layout (rAF) before measuring height.
+  const prevSubTabRef = React.useRef<string | null>(subTab);
+  React.useEffect(() => {
+    const wasOpen = prevSubTabRef.current;
+    prevSubTabRef.current = subTab;
+    if (subTab || !wasOpen) return; // only fire on close (had a subTab, now null)
+    setStick(true);
+    userScrolledRef.current = false;
+    pinTopRef.current = false;
+    const snap = () => {
+      const el = scrollRef.current;
+      if (!el) return;
+      selfScrollRef.current = true;
+      el.scrollTop = el.scrollHeight;
+      window.setTimeout(() => { selfScrollRef.current = false; }, 60);
+    };
+    // Two frames: after remount paints and after spacer sizing settles.
+    requestAnimationFrame(() => { snap(); requestAnimationFrame(snap); });
+  }, [subTab, setStick]);
 
   // Keep the view anchored as content changes: pin a freshly sent message to the
   // top once, otherwise follow the bottom only while the user is already there.

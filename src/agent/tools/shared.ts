@@ -48,7 +48,7 @@ export const IGNORE = new Set([
 
 // ---------------------------------------------------------------------------
 // Per-tool hard timeouts (ms). Prevents a hung Grep/Glob/Shell/etc. from
-// blocking the agent loop forever. Task/AskQuestion are excluded (own budgets).
+// blocking the agent loop forever. Task/AskQuestion excluded (no outer budget).
 // ---------------------------------------------------------------------------
 export const TOOL_TIMEOUT_MS: Record<string, number> = {
   // Outer safety net: slightly above each tool's own cap so the tool can
@@ -77,13 +77,11 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   TodoRead: 15_000,
   WritePlan: 10_000,
   SwitchMode: 5_000,
-  // Foreground Task budget (bg subagents use BG_SUBAGENT_MAX_MS in loop).
-  Task: 6 * 60_000,
 };
 /** Default when a tool has no explicit entry. */
 export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
-/** Tools that manage their own lifetime (user wait only). Task has a hard budget. */
-export const NO_TOOL_TIMEOUT = new Set(["AskQuestion"]);
+/** Tools that manage their own lifetime. Task has no outer budget — nested tools already time out. */
+export const NO_TOOL_TIMEOUT = new Set(["AskQuestion", "Task"]);
 
 /** Built-in defaults in seconds (for settings UI). */
 export const DEFAULT_TOOL_TIMEOUTS_SEC: Record<string, number> = Object.fromEntries(
@@ -123,35 +121,76 @@ export function withToolTimeout<T>(
   ms: number,
   label: string,
   onTimeout?: () => void,
+  signal?: AbortSignal,
 ): Promise<T> {
-  // ms <= 0: no outer race (AskQuestion manages its own lifetime).
+  // ms <= 0: no outer race (AskQuestion manages its own lifetime) — still honor abort.
   if (!ms || ms <= 0) {
-    return Promise.resolve(p).catch((e) => {
-      throw e instanceof Error ? e : new Error(String(e));
+    if (!signal) {
+      return Promise.resolve(p).catch((e) => {
+        throw e instanceof Error ? e : new Error(String(e));
+      });
+    }
+    return new Promise<T>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new Error(`aborted: ${label}`));
+        return;
+      }
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        try { onTimeout?.(); } catch { /* ignore */ }
+        reject(new Error(`aborted: ${label}`));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      Promise.resolve(p).then(
+        (v) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          resolve(v);
+        },
+        (e) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        },
+      );
     });
   }
   const limit = ms;
   return new Promise<T>((resolve, reject) => {
+    if (signal?.aborted) {
+      try { onTimeout?.(); } catch { /* ignore */ }
+      reject(new Error(`aborted: ${label}`));
+      return;
+    }
     let settled = false;
-    const timer = setTimeout(() => {
+    const done = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      try { onTimeout?.(); } catch { /* ignore */ }
-      reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = () => {
+      done(() => {
+        try { onTimeout?.(); } catch { /* ignore */ }
+        reject(new Error(`aborted: ${label}`));
+      });
+    };
+    const timer = setTimeout(() => {
+      done(() => {
+        try { onTimeout?.(); } catch { /* ignore */ }
+        reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
+      });
     }, limit);
+    signal?.addEventListener("abort", onAbort, { once: true });
     Promise.resolve(p).then(
-      (v) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (e) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      },
+      (v) => done(() => resolve(v)),
+      (e) => done(() => reject(e instanceof Error ? e : new Error(String(e)))),
     );
   });
 }
@@ -540,14 +579,28 @@ export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?:
  * Render a shell's state. Header + footer carry metadata (pid, timings,
  * exit_code); AwaitShell's `pattern` deliberately matches only the body.
  */
+/** Keep head + tail of long output; drop the middle (where most noise lives). */
+function clampMiddle(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const head = Math.floor(max * 0.6);
+  const tail = max - head;
+  const dropped = s.length - max;
+  return `${s.slice(0, head)}\n... [${dropped} chars truncated] ...\n${s.slice(s.length - tail)}`;
+}
+
 export function renderShell(sh: BgShell): string {
   const elapsed = Date.now() - sh.startedAt;
-  const head = `[shell ${sh.id}] pid=${sh.proc.pid ?? "?"} running_for_ms=${elapsed}\n$ ${sh.command}`;
-  const body = sh.output.slice(0, 20000);
-  const footer = sh.done
-    ? `(exit_code=${sh.exitCode} elapsed_ms=${elapsed})`
-    : `(still running — poll with AwaitShell shell_id="${sh.id}")`;
-  return `${head}\n${body}\n${footer}`;
+  // Trim trailing blank lines the shell echoes; collapse >2 blank lines.
+  const cleaned = sh.output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  const body = clampMiddle(cleaned, 12000);
+  if (sh.done) {
+    // Completed: the model only needs output + exit code. Drop pid/running_for_ms.
+    const status = sh.exitCode === 0 ? "" : ` (exit ${sh.exitCode})`;
+    return `${body || "(no output)"}\n[done${status} in ${elapsed}ms]`;
+  }
+  // Still running: keep the poll hint + id so the model can await it.
+  const head = `[shell ${sh.id}] running_for_ms=${elapsed}`;
+  return `${head}\n${body}\n(still running - poll with AwaitShell shell_id="${sh.id}")`;
 }
 
 // ---------------------------------------------------------------------------

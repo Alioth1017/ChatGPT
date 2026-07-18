@@ -340,11 +340,27 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
 
   if (ev.type === "tool-call-completed") {
     const { list, turn } = ensureAssistant(turns);
-    turn.blocks = turn.blocks.map((b) =>
-      b.kind === "tool" && b.callId === ev.callId
-        ? { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine }
-        : b
-    );
+    turn.blocks = turn.blocks.map((b) => {
+      if (b.kind !== "tool" || b.callId !== ev.callId) return b;
+      // Never reopen a settled tool if a late/duplicate completion races in.
+      if (b.status !== "running" && b.status === ev.status) {
+        return {
+          ...b,
+          result: ev.result ?? b.result,
+          diff: ev.diff ?? b.diff,
+          startLine: ev.startLine ?? b.startLine,
+          endLine: ev.endLine ?? b.endLine,
+        };
+      }
+      return {
+        ...b,
+        status: ev.status,
+        result: ev.result,
+        diff: ev.diff,
+        startLine: ev.startLine,
+        endLine: ev.endLine,
+      };
+    });
     return list;
   }
 

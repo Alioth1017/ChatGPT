@@ -30,10 +30,6 @@ const MULTITASK_REMINDER =
 	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
 
 const MAX_STEPS = 50;
-/** Foreground subagent hard budget (abort + settle). */
-const SUBAGENT_MAX_MS = 6 * 60_000;
-/** Background subagent hard budget. */
-const BG_SUBAGENT_MAX_MS = 10 * 60_000;
 /** Coalesce high-frequency stream UI events (ms). */
 const STREAM_COALESCE_MS = 40;
 
@@ -185,14 +181,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
-			const budgetMs = opts?.runInBackground ? BG_SUBAGENT_MAX_MS : SUBAGENT_MAX_MS;
-			let budgetHit = false;
-			const budgetTimer = setTimeout(() => {
-				budgetHit = true;
-				try { childAC.abort(); } catch { /* ignore */ }
-			}, budgetMs);
-			// Isolated chat: empty history, own context budget. Parent only gets
-			// the final summary string (tool result / run-result) — never sub steps.
+			// No outer Task/subagent wall clock — nested tools already have per-tool timeouts.
+			// Parent Stop still aborts via childAC.
+			// Same context window + step budget as the parent agent (compaction/summarize
+			// runs inside the child loop against this budget).
+			const subContextTokens =
+				contextTokens && contextTokens > 0 ? contextTokens : undefined;
 			const runP = runAgent({
 				apiBaseUrl,
 				apiKey,
@@ -201,7 +195,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				prompt: subPrompt,
 				history: [],
 				maxTokens,
-				contextTokens,
+				maxSteps,
+				autoContinue,
+				contextTokens: subContextTokens,
 				sampling,
 				modelParams,
 				anthropic,
@@ -212,14 +208,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				enableWorkspaceContext,
 				approve,
 				isSubagent: true,
+				// Nested Task disabled; child still needs hooks for compaction etc.
+				onHook,
+				onBeforeShell,
+				onAfterEdit,
 				signal: childAC.signal,
 				emit: (e) => {
 					if (e.type === "run-result") finalText = e.text;
 					// UI stream only — not parent history. Coalesced via parent emit.
 					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
-			}).finally(() => {
-				clearTimeout(budgetTimer);
 			});
 			// Background subagents return immediately; they keep streaming via emit.
 			if (opts?.runInBackground) {
@@ -230,15 +228,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				const tracked = runP
 					.then(() => ({
 						title,
-						text: budgetHit
-							? `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`
-							: (finalText || "(subagent finished with no summary)"),
+						text: finalText || "(subagent finished with no summary)",
 					}))
 					.catch((e) => ({
 						title,
-						text: budgetHit
-							? `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`
-							: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
+						text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
 					}))
 					.finally(() => {
 						parentSig.removeEventListener("abort", onParentAbort);
@@ -246,24 +240,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					});
 				bgSubagents.push(tracked);
 				void tracked.then((v) => { bgSettled[idx] = v; });
-				// Mark nested status running so UI countdown keeps ticking after parent tool completes.
 				if (callId) emit({ type: "subagent-event", callId, event: { type: "run-status", status: "running" } });
 				return `Launched ${title} in the background${callId ? ` (call ${callId})` : ""}. It will keep working and stream its results; you do not need to wait or poll for it. When all background subagents finish, their summaries will be delivered to you automatically and you can continue.`;
 			}
 			try {
 				await runP;
 			} catch (e) {
-				if (budgetHit) return `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`;
 				if (childAC.signal.aborted || parentSig.aborted) {
 					return "(subagent cancelled)";
 				}
 				return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
 			} finally {
-				clearTimeout(budgetTimer);
 				parentSig.removeEventListener("abort", onParentAbort);
 				onHook?.("subagentStop", { subagent: subagentName || "subagent" });
 			}
-			if (budgetHit) return `(subagent timed out after ${Math.round(budgetMs / 1000)}s)`;
 			if (childAC.signal.aborted || parentSig.aborted) return "(subagent cancelled)";
 			return finalText || "(subagent finished with no summary)";
 		};
@@ -668,11 +658,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						timeoutMs = timeoutMs ? Math.min(timeoutMs, 15_000) : 15_000;
 					}
 				}
-				// Task: use Task budget (foreground); bg still has BG_SUBAGENT_MAX_MS.
-				if (call.name === "Task" && input?.run_in_background === true) {
-					timeoutMs = BG_SUBAGENT_MAX_MS;
-				}
-				// Announce card + budget; startedAt set when exec actually begins.
+				// Task: no outer timeout — nested tool calls already time out individually.
+				// Announce card; startedAt set when exec actually begins.
 				emit({
 					type: "tool-call-started",
 					callId: call.id,
@@ -763,15 +750,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 								};
 								finishUi(i);
 							},
+							toolAc.signal,
 						);
+						if (completedUi.has(i)) return;
 						results[i] = { status: out.startsWith("error:") ? "error" : "completed", output: out };
 						finishUi(i);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
+						if (completedUi.has(i)) return;
 						results[i] = {
 							status: "error",
-							output: msg.startsWith("timeout:")
-								? `error: ${msg}. Tool aborted.`
+							output: msg.startsWith("timeout:") || msg.startsWith("aborted:")
+								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`
 								: `error: ${msg}`,
 						};
 						finishUi(i);
@@ -859,11 +849,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 								};
 								finishUi(i);
 							},
+							// Also settle when UI cancelSubagent aborts (countdown-0), not only wall timer.
+							toolAc.signal,
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
 						try { toolAc.abort(); } catch { /* ignore */ }
-						const isTo = timedOut || msg.startsWith("timeout:");
+						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
 						r = {
 							output: isTo
 								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
@@ -871,6 +863,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						};
 					} finally {
 						signal.removeEventListener("abort", onParentAbort);
+					}
+					// Timeout path already set results + finishUi; don't overwrite with a late success.
+					if (timedOut || completedUi.has(i)) {
+						if (!results[i]) {
+							results[i] = {
+								status: "error",
+								output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+							};
+						}
+						finishUi(i);
+						return;
 					}
 					const status: "completed" | "error" = r.output.startsWith("error:") ? "error" : "completed";
 					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, image: r.image };

@@ -310,7 +310,14 @@ body {
 .todo-item.cancelled .todo-mark { color: var(--fg-faint); }
 
 /* Subagent */
-.subagent-prompt { font-size: 11.5px; color: var(--fg-dim); background: var(--bg-dark); border-radius: 6px; padding: 8px; margin-bottom: 6px; white-space: pre-wrap; max-height: 120px; overflow: auto; }
+/* Task prompt is its own single container (no nested .bubble clamp). */
+.subagent-task-msg .subagent-prompt { font-size: 13px; color: var(--fg); background: var(--input-bg); border: 1px solid var(--border); border-radius: 12px; padding: 8px 10px; margin: 2px 0 0; line-height: 1.5; word-wrap: break-word; cursor: pointer; transition: border-color .12s; }
+.subagent-task-msg .subagent-prompt:hover { border-color: var(--vscode-focusBorder); }
+.subagent-task-msg .subagent-prompt.clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.subagent-task-msg .subagent-prompt.open { display: block; overflow: visible; }
+.subagent-task-msg .subagent-prompt > *:first-child { margin-top: 0; }
+.subagent-task-msg .subagent-prompt > *:last-child { margin-bottom: 0; }
+.subagent-prompt-empty { color: var(--fg-faint); font-style: italic; }
 
 .tab-spin { width: 9px; height: 9px; margin-right: 5px; flex: 0 0 auto; }
 

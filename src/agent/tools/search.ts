@@ -87,14 +87,14 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
       };
       const onAbort = () => {
         try { c.kill("SIGTERM"); } catch { /* ignore */ }
-        finish(o ? o.slice(0, 50_000) + "\n(grep aborted)" : "(grep aborted)");
+        finish(o ? o.slice(0, 12_000) + "\n(grep aborted)" : "(grep aborted)");
       };
       // Hard kill hung rg even if AbortSignal is missing/ignored.
       const timer = setTimeout(() => {
         try { c.kill("SIGKILL"); } catch {
           try { c.kill("SIGTERM"); } catch { /* ignore */ }
         }
-        finish(o ? o.slice(0, 50_000) + "\n(grep timed out)" : "(grep timed out)");
+        finish(o ? o.slice(0, 12_000) + "\n(grep timed out)" : "(grep timed out)");
       }, 15_000);
       try {
         c = spawn("rg", args, { cwd: root, windowsHide: true });
@@ -263,14 +263,16 @@ export const semanticSearchTool = defineTool("SemanticSearch", false, async (inp
 
   let hits: Awaited<ReturnType<typeof semanticIndexSearch>> = [];
   try {
-    hits = await semanticIndexSearch(root, query, 12, filter);
+    hits = await semanticIndexSearch(root, query, 8, filter);
   } catch {
     hits = [];
   }
   if (!hits.length) return keywordFallback(input, abortSignal, callId, ctx);
 
+  // Cap each chunk so a few large hits don't blow the context budget.
+  const snip = (t: string) => (t.length > 1200 ? t.slice(0, 1200) + "\n... (trimmed - Read the file for full context)" : t);
   const out = hits
-    .map((h) => `${h.path}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.text}`)
+    .map((h) => `${h.path}:${h.start}-${h.end} (${h.score.toFixed(2)})\n${snip(h.text)}`)
     .join("\n\n---\n\n");
   return { output: out };
   } catch (e) {
@@ -303,9 +305,10 @@ export const searchDocsTool = defineTool("SearchDocs", false, async (input) => {
   all.sort((a, b) => b.score - a.score);
   const top = all.slice(0, k);
   if (!top.length) return { output: "(no matching excerpts)" };
+  const snip = (t: string) => (t.length > 1200 ? t.slice(0, 1200) + "\n... (trimmed)" : t);
   return {
     output: top
-      .map((h) => `[${h.doc}] ${h.title} - ${h.url}  (score ${h.score.toFixed(3)})\n${h.text}`)
+      .map((h) => `[${h.doc}] ${h.title} - ${h.url} (${h.score.toFixed(2)})\n${snip(h.text)}`)
       .join("\n\n---\n\n"),
   };
   } catch (e) {

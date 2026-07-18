@@ -231,10 +231,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           // callId is globally unique; abort tool/subagent and settle the card now.
           for (const [cid, s] of this._sessions) {
             const a = s.subagentAborts.get(data.callId);
-            // Always try abort first so hung Read/Shell stop even if card already settled.
+            // Fire abort first so withToolTimeout(signal) rejects immediately.
             if (a) {
               try { a(); } catch { /* ignore */ }
-              s.subagentAborts.delete(data.callId);
+              // Keep handler until tool loop observes abort (Delete/Read may still be mid-IO).
+              // Re-register a no-op-safe re-fire; delete after settle event below.
             }
             // Mark card settled immediately so spinner stops even if the worker
             // never emits a terminal event (timeout / hung process / missing path).
@@ -247,8 +248,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               const blocks = turn.blocks.map((b) => {
                 if (b.kind !== "tool" || b.callId !== data.callId) return b;
                 toolName = b.name;
-                // Force settle even if already "error" but still showing running UI race.
-                if (b.status === "running" || b.subStatus === "running" || timedOut) {
+                // Always force-settle on cancel/timeout so EDIT/Delete stop spinning.
+                if (b.status === "running" || b.subStatus === "running" || timedOut || data.reason === "user") {
                   hit = true;
                   changed = true;
                   const subStatus =
@@ -271,6 +272,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               return changed ? { ...turn, blocks } : turn;
             });
             if (!hit && !a) continue;
+            if (a) s.subagentAborts.delete(data.callId);
             this._persistTurnsNow(cid, s);
             const resultMsg = timedOut
               ? `(timeout after tool budget)`

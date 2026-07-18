@@ -223,13 +223,12 @@ function SubagentCard({ block, onOpen }: { block: ToolBlock; onOpen?: (callId: s
   const subtitle = running ? subagentActivity(block.subBlocks) : undefined;
 
   return (
-    <div className="subagent-card" onClick={() => onOpen?.(block.callId)} role="button">
+    <div className="subagent-card" onClick={() => onOpen?.(block.callId)} role="button" title="Open subagent">
       <div className="subagent-card-main">
         <span className="ticon"><Icon name="task" /></span>
         <span className="label">{i.description || "Subagent"}</span>
         <span className="sub-spacer" />
-        <TimeoutBadge block={block} />
-        <span className="sub-steps">{running ? `${steps} steps…` : `${steps} steps`}</span>
+        <span className="sub-steps">{running ? `${steps} steps...` : `${steps} steps`}</span>
         <span className="badge badge-agent">{isReadonlySubagent(i) ? "Explore" : "Agent"}</span>
         {running ? <span className="spinner" /> : <StatusIcon status={block.subStatus === "error" ? "error" : "completed"} />}
         <Icon name="chevR" size={14} className="sub-open-chev" />
@@ -329,13 +328,9 @@ function StatusIcon({ status }: { status: ToolBlock["status"] }) {
 /** True while this tool/task should show a live timeout countdown. */
 export function isToolCountdownActive(block: ToolBlock): boolean {
   if (block.name === "AskQuestion" || block.name === "ask_question") return false;
-  const isTask = block.name === "Task" || block.name === "task";
-  if (isTask) {
-    const subDone = block.subStatus === "finished" || block.subStatus === "cancelled" || block.subStatus === "error";
-    if (subDone) return false;
-    // Parent tool may complete early (bg Task); keep counting while nested work open.
-    return block.status === "running" || block.subStatus === "running" || !!block.subBlocks?.length;
-  }
+  // Task/subagent: no outer countdown — nested tools carry their own timeouts.
+  if (block.name === "Task" || block.name === "task") return false;
+  if (block.status === "completed" || block.status === "error") return false;
   return block.status === "running";
 }
 
