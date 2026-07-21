@@ -4,6 +4,28 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.7] - 2026-07-21
+
+### Added
+
+- Lossless persisted chat history for export; pruning, compaction, and thinking removal now affect only the disposable model context
+- Context economy layer prunes stale tool dumps during active runs and slims old Write/StrReplace args (keeps four latest results + two latest call batches verbatim)
+- Signal-aware stale-output summaries preserve errors, warnings, diffs, and line-addressed evidence
+- Compact tool schemas keep every tool callable while removing repeated long descriptions after the initial turn
+- Latest-wins dedup: older Read/ListDir/Grep/WebFetch results for the same target become one-line supersede stubs
+- Per-run frozen timestamp keeps the cached query block byte-stable across steps (prompt-cache friendly)
+- Shell output collapses runs of identical lines into "line ×N" (RTK-style)
+
+### Fixed
+
+- Background subagents no longer false-timeout while still working (removed wall-clock wait; parent awaits real settle or user Stop)
+- Parent loop no longer resumes / re-dispatches while a prior Task wave is still running
+
+### Changed
+
+- Auto-compaction starts at safe subtask boundaries after 55% fill; 72% remains the hard safety trigger
+- Thinking text no longer counted toward context budget (UI-only; never on the wire)
+
 ## [0.0.6] - 2026-07-18
 
 ### Added

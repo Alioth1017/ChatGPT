@@ -18,7 +18,8 @@ export function stepTokens(s: Step): number {
     chars += s.text.length;
     for (const a of s.attachments || []) chars += a.kind === "image" ? 1200 : (a.data?.length || 0);
   } else if (s.kind === "assistant") {
-    chars += (s.text?.length || 0) + (s.thinking?.length || 0);
+    // thinking is UI-only — never sent on the wire (see buildMessages).
+    chars += s.text?.length || 0;
     for (const c of s.calls || []) chars += (c.arguments?.length || 0) + (c.name?.length || 0) + 8;
   } else {
     chars += s.output?.length || 0;
@@ -113,6 +114,9 @@ export interface CursorContextBlocks {
   openFiles: string;
   /** Mode-specific reminder appended right after the live <user_query>. */
   reminder?: string;
+  /** Stable per-run timestamp. A fresh Date each step would invalidate the
+   *  cached query block on every model call within the run. */
+  timestamp?: string;
 }
 
 /**
@@ -158,7 +162,7 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
         }
         parts.push({
           type: "text",
-          text: `<timestamp>\n${new Date().toLocaleString()}\n</timestamp>\n<user_query>\n${textContent}\n</user_query>${ctx!.reminder ? `\n${ctx!.reminder}` : ""}`,
+          text: `<timestamp>\n${ctx!.timestamp || new Date().toLocaleString()}\n</timestamp>\n<user_query>\n${textContent}\n</user_query>${ctx!.reminder ? `\n${ctx!.reminder}` : ""}`,
           cache_control: EPHEMERAL,
         });
         for (const img of images) {

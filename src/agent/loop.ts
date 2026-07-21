@@ -14,6 +14,7 @@ import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
 import { buildMessages, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
+import { economizeHistory, COMPACT_AT_FILL, COMPACT_KEEP_FRAC, isCompactionBoundary } from "./contextEconomy";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
 import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
@@ -116,7 +117,14 @@ function coalesceEmit(raw: (e: AgentEvent) => void): (e: AgentEvent) => void {
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
-	const { apiBaseUrl, apiKey, model, prompt, attachments, history, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, subagentModel, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
+	// Model history is disposable and may be compacted/pruned. Persisted history
+	// remains lossless for chat display/export, including full tool output/thinking.
+	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
+	const pushHistory = (...steps: Step[]) => {
+		history.push(...steps);
+		persistedHistory.push(...steps.map((s) => structuredClone(s)));
+	};
 	const emit = coalesceEmit(rawEmit);
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
@@ -132,6 +140,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Background subagent results already fed back into the conversation.
 	let bgReported = 0;
 	const started = Date.now();
+	// Frozen per run: a changing timestamp inside the cached query block would
+	// break the provider prompt-cache prefix on every step of a multi-step run.
+	const runTimestamp = new Date(started).toLocaleString();
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
 	const toolCtx: ToolContext = {
@@ -314,7 +325,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				.filter((n) => !disabledToolNames.has(n)),
 		);
 
-	history.push({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
+	pushHistory({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
 	let settledEmitted = false;
 	const emitSettled = (status: "finished" | "cancelled" | "error") => {
 		if (settledEmitted) return;
@@ -346,7 +357,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				bgReported++;
 			}
 			if (done.length) {
-				history.push({
+				pushHistory({
 					kind: "user",
 					text: `[System: Background subagent${done.length > 1 ? "s" : ""} finished — results below.]\n\n${done.map((v) => `### ${v.title}\n${v.text}`).join("\n\n")}`,
 				});
@@ -356,11 +367,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 		const bgPending = () => bgSubagents.length > bgReported;
 
-		/** Race a promise against abort + hard timeout so a stuck subagent cannot hang the chat forever. */
-		const raceAbort = <T,>(p: Promise<T>, ms = 120_000): Promise<T | "aborted" | "timeout"> =>
+		/** Race a promise against user abort. No wall clock: a subagent's own
+		 *  per-tool timeouts + step limit guarantee it terminates, so declaring
+		 *  "timeout" here while it is still working desyncs the parent (it
+		 *  continues, re-dispatches duplicate work, and the late result lands in
+		 *  a slot that was already reported). */
+		const raceAbort = <T,>(p: Promise<T>): Promise<T | "aborted"> =>
 			new Promise((resolve) => {
 				let done = false;
-				const finish = (v: T | "aborted" | "timeout") => {
+				const finish = (v: T | "aborted") => {
 					if (done) return;
 					done = true;
 					resolve(v);
@@ -368,10 +383,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (signal.aborted) { finish("aborted"); return; }
 				const onAbort = () => finish("aborted");
 				signal.addEventListener("abort", onAbort, { once: true });
-				const timer = setTimeout(() => finish("timeout"), ms);
 				p.then(
-					(v) => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); finish(v); },
-					() => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); finish("aborted"); },
+					(v) => { signal.removeEventListener("abort", onAbort); finish(v); },
+					() => { signal.removeEventListener("abort", onAbort); finish("aborted"); },
 				);
 			});
 
@@ -387,17 +401,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				type: "shell-notify",
 				message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…`,
 			});
-			const outcome = await raceAbort(Promise.allSettled(pending), 10 * 60_000);
+			// Wait until every launched subagent actually settles (or the user
+			// aborts). Never declare a still-running subagent "timed out".
+			const outcome = await raceAbort(Promise.allSettled(pending));
 			if (outcome === "aborted" || signal.aborted) {
 				for (let i = bgReported; i < bgSubagents.length; i++) {
 					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
-				}
-				flushSettledBg();
-				return true;
-			}
-			if (outcome === "timeout") {
-				for (let i = bgReported; i < bgSubagents.length; i++) {
-					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(timed out waiting for subagent)" };
 				}
 				flushSettledBg();
 				return true;
@@ -455,20 +464,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const budget = contextTokens && contextTokens > 0
 				? Math.max(1024, contextTokens - (maxTokens ?? 4096) - 1024)
 				: 0;
-			// 1) Auto-summarization (Cursor/Claude-Code style): when the conversation
-			// nears the window (80% of budget), replace the older steps with an
-			// LLM-written summary instead of silently dropping them. Mutates history
-			// so the compaction persists across steps and runs.
-			// Trigger on either the local estimate or the provider-reported prompt
-			// size of the previous request (authoritative when available).
-			// Smart summarize at 80% of usable context budget.
+			// 0) Cheap in-place economy every step: stub stale tool dumps + slim old
+			// edit args. Free wins (no LLM call). UI cards keep full results via turns.
+			economizeHistory(history);
+			// 1) Auto-summarization: compact at a semantic boundary from 55% fill;
+			// force at 72% as a safety valve. Avoids lossy mid-derivation summaries.
 			const usedEst = stepsTokens(history) + Math.ceil(system.length / 4);
 			const fill = Math.max(usedEst, lastPrompt);
-			if (budget > 0 && fill >= budget * 0.8) {
-				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * 0.35));
+			const shouldCompact = budget > 0 && (
+				fill >= budget * COMPACT_AT_FILL ||
+				(fill >= budget * 0.55 && isCompactionBoundary(history))
+			);
+			if (shouldCompact) {
+				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * COMPACT_KEEP_FRAC));
 				if (prefix.length >= 2) {
 					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
-					// Visible in-chat marker while the summary is being generated.
 					emit({ type: "compaction", status: "running" });
 					try {
 						const summary = await summarizeSteps(prefix);
@@ -478,9 +488,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							{ kind: "assistant", text: "Understood. Continuing with the summarized context.", calls: [] },
 							...tail,
 						);
+						// Re-economize the new tail (summary is dense; keep it).
+						economizeHistory(history);
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
-						// Summarizer failed (network etc.) — fall through to plain trimming.
 						emit({ type: "compaction", status: "failed" });
 					}
 				}
@@ -492,7 +503,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
 			}
 			const liveCtx = cursorCtx
-				? { ...cursorCtx, reminder: mode === "multitask" ? MULTITASK_REMINDER : undefined }
+				? { ...cursorCtx, reminder: mode === "multitask" ? MULTITASK_REMINDER : undefined, timestamp: runTimestamp }
 				: cursorCtx;
 			const messages = buildMessages(system, fitted, liveCtx);
 			let assistantText = "";
@@ -504,7 +515,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const callIdByIndex = new Map<number, string>();
 			const argsByIndex = new Map<number, string>();
 
-			const activeTools = [...schemasForMode(mode).filter((s) => !disabledToolNames.has(s.function.name)), ...mcpSchemas];
+			// Tool definitions are paid on every step. Keep every tool callable, but
+			// replace long instructional descriptions after the first turn; parameter
+			// schemas retain the exact calling contract.
+			const compactSchema = (s: ToolSchema): ToolSchema => {
+				if (step === 0 || s.function.description.length <= 240) return s;
+				const first = s.function.description.split(/\n|(?<=[.!?])\s/)[0]?.trim();
+				return {
+					...s,
+					function: {
+						...s.function,
+						description: (first || `Use ${s.function.name} when needed.`).slice(0, 240),
+					},
+				};
+			};
+			const activeTools = [
+				...schemasForMode(mode).filter((s) => !disabledToolNames.has(s.function.name)).map(compactSchema),
+				...mcpSchemas.map(compactSchema),
+			];
 
 			// Stream response from LLM
 			for await (const ev of streamChat({
@@ -560,7 +588,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 
 			if (assistantText || thinking || !calls.length) {
-				history.push({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls: [] });
+				pushHistory({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls: [] });
 			}
 
 			if (!calls.length) {
@@ -568,7 +596,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// calling write_plan, force it once.
 				if (mode === "plan" && !planWritten && !planNudged) {
 					planNudged = true;
-					history.push({
+					pushHistory({
 						kind: "user",
 						text: "[System: You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.]",
 					});
@@ -588,7 +616,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Truncated response (hit max output tokens): the model didn't choose to
 				// stop — never treat this as a final answer. Ask it to continue.
 				if (isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
-					history.push({
+					pushHistory({
 						kind: "user",
 						text: "[System: Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.]",
 					});
@@ -597,7 +625,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Thinking-only turn (reasoned but produced no answer and no tool calls):
 				// the task isn't done — nudge it to act instead of silently stopping.
 				if (isAgentic() && !assistantText.trim() && thinking.trim()) {
-					history.push({
+					pushHistory({
 						kind: "user",
 						text: "[System: You produced only internal reasoning with no answer or tool calls. Continue working on the task now — make the necessary tool calls, or reply with your final answer if fully finished.]",
 					});
@@ -607,7 +635,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Empty turn right after a tool result → nudge for more work. If it
 				// produced any text, that's its final answer — stop.
 				if (isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
-					history.push({
+					pushHistory({
 						kind: "user",
 						text: "[System: If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.]",
 					});
@@ -618,7 +646,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					const open = getTodos().filter((t) => t.status === "pending" || t.status === "in_progress");
 					if (open.length) {
 						todoNudged = true;
-						history.push({
+						pushHistory({
 							kind: "user",
 							text: `[System: Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.]`,
 						});
@@ -630,7 +658,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 
 			// Add a separate step for the tool calls so they are separated in history
-			history.push({ kind: "assistant", text: "", calls: calls });
+			pushHistory({ kind: "assistant", text: "", calls: calls });
 
 			const parsed = calls.map((call) => {
 				let input: any = {};
@@ -949,8 +977,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// History in call order (model expects stable tool-result sequencing).
-				history.push({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+				// Keep newest evidence intact. economizeHistory prunes it only after
+				// four newer results exist, preserving active reasoning quality.
+				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
 			}
 			// After launching background Task(s), wait for that wave before calling the
 			// model again. Otherwise the next turn (or empty-turn / todo nudge) races

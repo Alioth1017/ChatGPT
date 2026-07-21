@@ -588,10 +588,27 @@ function clampMiddle(s: string, max: number): string {
   return `${s.slice(0, head)}\n... [${dropped} chars truncated] ...\n${s.slice(s.length - tail)}`;
 }
 
+/** Collapse consecutive duplicate lines into "line ×N" (RTK-style log dedup). */
+function collapseRepeats(s: string): string {
+  const lines = s.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    let j = i + 1;
+    while (j < lines.length && lines[j] === lines[i]) j++;
+    const n = j - i;
+    if (n >= 3 && lines[i].trim()) out.push(`${lines[i]}  [×${n}]`);
+    else for (let k = i; k < j; k++) out.push(lines[k]);
+    i = j;
+  }
+  return out.join("\n");
+}
+
 export function renderShell(sh: BgShell): string {
   const elapsed = Date.now() - sh.startedAt;
-  // Trim trailing blank lines the shell echoes; collapse >2 blank lines.
-  const cleaned = sh.output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  // Trim trailing blank lines the shell echoes; collapse >2 blank lines and
+  // runs of identical lines (progress spinners, repeated warnings).
+  const cleaned = collapseRepeats(sh.output.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trimEnd());
   const body = clampMiddle(cleaned, 12000);
   if (sh.done) {
     // Completed: the model only needs output + exit code. Drop pid/running_for_ms.
