@@ -14,7 +14,7 @@ import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
 import { buildMessages, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
-import { economizeHistory, COMPACT_AT_FILL, COMPACT_KEEP_FRAC, isCompactionBoundary } from "./contextEconomy";
+import { economizeHistory, COMPACT_AT_FILL, COMPACT_SOFT_FILL, COMPACT_KEEP_FRAC, isCompactionBoundary } from "./contextEconomy";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
 import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
@@ -467,13 +467,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// 0) Cheap in-place economy every step: stub stale tool dumps + slim old
 			// edit args. Free wins (no LLM call). UI cards keep full results via turns.
 			economizeHistory(history);
-			// 1) Auto-summarization: compact at a semantic boundary from 55% fill;
-			// force at 72% as a safety valve. Avoids lossy mid-derivation summaries.
+			// 1) Auto-summarization: soft boundary from 65% fill; hard at 78%.
+			// Live-turn tool results stay verbatim (see economizeHistory) so the
+			// agent cannot amnesically re-do the same edits/reads mid-task.
 			const usedEst = stepsTokens(history) + Math.ceil(system.length / 4);
 			const fill = Math.max(usedEst, lastPrompt);
 			const shouldCompact = budget > 0 && (
 				fill >= budget * COMPACT_AT_FILL ||
-				(fill >= budget * 0.55 && isCompactionBoundary(history))
+				(fill >= budget * COMPACT_SOFT_FILL && isCompactionBoundary(history))
 			);
 			if (shouldCompact) {
 				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * COMPACT_KEEP_FRAC));

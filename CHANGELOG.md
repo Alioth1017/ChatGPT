@@ -4,6 +4,17 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.8] - 2026-07-21
+
+### Fixed
+
+- Agents/subagents no longer infinite-loop from mid-task amnesia: live-turn tool results and edit args stay verbatim until the next user message
+
+### Changed
+
+- Context pruning only touches older turns; live turn is fully protected (12 prior results + 6 call batches kept verbatim)
+- Auto-compaction soft boundary at 65% / hard at 78%; verbatim tail after summarize raised to 50%
+
 ## [0.0.7] - 2026-07-21
 
 ### Added
